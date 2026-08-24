@@ -1,0 +1,2 @@
+"""Pure deterministic validation rules."""
+

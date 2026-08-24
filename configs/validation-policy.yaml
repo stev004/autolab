@@ -1,0 +1,56 @@
+schema_version: "1"
+policy_name: simulated_assay_safety
+policy_version: "1.0.0"
+
+allowed_materials:
+  - reagent
+  - sample
+  - blank
+  - calibration_standard
+  - positive_control
+  - check_standard
+
+allowed_command_types:
+  - dispense
+  - aspirate
+  - transfer
+  - mix
+  - incubate
+  - measure_absorbance
+
+required_control_types:
+  - blank
+  - standard
+  - positive
+
+minimum_dispense_volume:
+  value: 1
+  unit: microliter
+
+maximum_dispense_volume:
+  value: 250
+  unit: microliter
+
+maximum_well_volume:
+  value: 300
+  unit: microliter
+
+wavelength_range:
+  minimum:
+    value: 400
+    unit: nanometer
+  maximum:
+    value: 700
+    unit: nanometer
+  resolution:
+    value: 1
+    unit: nanometer
+
+minimum_blank_replicates: 3
+minimum_standard_levels: 6
+minimum_standard_replicates: 3
+minimum_control_replicates: 3
+
+supported_vessel_types:
+  - microplate_96_well
+

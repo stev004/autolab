@@ -1,0 +1,43 @@
+schema_version: "1"
+campaign: {name: assay_reagent_reduction_manual, seed: 41027, max_experiments: 8}
+objective:
+  metrics:
+    - {name: cost_per_test, direction: minimize, unit: GBP}
+    - {name: reagent_consumption, direction: minimize, unit: milligram}
+  performance_constraints:
+    - {metric: control_cv, operator: lte, threshold: 0.05}
+    - {metric: calibration_r_squared, operator: gte, threshold: 0.99}
+    - {metric: signal_to_noise, operator: gte, threshold: 10.0}
+parameter_space:
+  reagent_concentration: {kind: continuous, unit: milligram / milliliter, minimum: 0.1, maximum: 1.0, resolution: 0.001}
+  reagent_volume: {kind: continuous, unit: microliter, minimum: 20, maximum: 200, resolution: 0.1}
+  sample_volume: {kind: continuous, unit: microliter, minimum: 10, maximum: 100, resolution: 0.1}
+  incubation_time: {kind: continuous, unit: minute, minimum: 1, maximum: 30, resolution: 0.1}
+  temperature: {kind: continuous, unit: degC, minimum: 18, maximum: 40, resolution: 0.1}
+assay_design:
+  wavelength: {value: 520, unit: nanometer}
+  blank_replicates: 3
+  standard_levels: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+  standard_replicates: 3
+  control_level: 0.5
+  control_replicates: 4
+  check_standard_level: 0.7
+  check_standard_replicates: 2
+  maximum_well_volume: {value: 300, unit: microliter}
+execution:
+  mode: human_manual
+  capability_profile: human_assay_v1
+  measurement_source: manual_entry
+  operator_id: steven
+simulation:
+  # Retained only for the V0 parameter domain and configured cost coefficients.
+  # Human execution never imports or calls the hidden response surface.
+  model: nonlinear_colorimetric_assay_v1
+  seed: 73109
+  outlier_probability: 0.015
+  cost:
+    fixed_consumables: {value: 0.05, unit: GBP}
+    reagent_per_milligram: {value: 0.08, unit: GBP / milligram}
+    sample_per_microliter: {value: 0.0002, unit: GBP / microliter}
+    incubation_per_minute: {value: 0.0005, unit: GBP / minute}
+optimization: {strategy: bayesian, startup_experiments: 4, maximum_grid_size: 10000}
