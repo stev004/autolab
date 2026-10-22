@@ -560,21 +560,19 @@ def render_measurements_csv(worklist: OperatorWorklist) -> str:
     writer.writerow(
         (
             "sample_id",
-            "well",
             "measurement_type",
             "wavelength_nm",
             "value",
             "unit",
             "timestamp",
             "status",
-            "note",
+            "notes",
         )
     )
     for row in worklist.measurement_sheet:
         writer.writerow(
             (
                 row.vessel_id,
-                row.location,
                 row.measurement_name,
                 _decimal_text(row.wavelength.to("nanometer").value),
                 "",

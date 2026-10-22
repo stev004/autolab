@@ -135,7 +135,7 @@ class ExecutionConfig(DomainModel):
     backend: Literal["simulated"] | None = None
     capability_profile: Literal["simulated_assay_v1", "human_assay_v1"]
     measurement_source: Literal[
-        "manual_entry", "csv_import", "mock_physical_sensor"
+        "manual_entry", "csv_import", "physical_sensor", "mock_physical_sensor"
     ] | None = None
     operator_id: str | None = None
     sensor: SensorConfig | None = None
@@ -165,9 +165,10 @@ class ExecutionConfig(DomainModel):
                 raise ValueError("human_manual cannot configure a sensor")
             if (
                 self.mode == "human_sensor"
-                and self.measurement_source != "mock_physical_sensor"
+                and self.measurement_source
+                not in {"physical_sensor", "mock_physical_sensor"}
             ):
-                raise ValueError("human_sensor V0.5 requires mock_physical_sensor")
+                raise ValueError("human_sensor requires a physical sensor source")
             if self.mode == "human_sensor" and self.sensor is None:
                 raise ValueError("human_sensor requires sensor configuration")
         if self.operator_id is not None and not self.operator_id.strip():
@@ -176,16 +177,30 @@ class ExecutionConfig(DomainModel):
 
 
 class SensorConfig(DomainModel):
-    adapter: Literal["mock_physical"]
+    adapter: str
     sensor_id: str
-    fixture_path: str
+    fixture_path: str | None = None
+    settings: dict[str, object] = Field(default_factory=dict)
 
-    @field_validator("sensor_id", "fixture_path")
+    @field_validator("adapter", "sensor_id")
     @classmethod
     def _nonempty_sensor_value(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("sensor configuration values cannot be blank")
         return value.strip()
+
+    @field_validator("fixture_path")
+    @classmethod
+    def _nonempty_fixture_path(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("fixture_path cannot be blank")
+        return None if value is None else value.strip()
+
+    @model_validator(mode="after")
+    def _mock_fixture_is_explicit(self) -> SensorConfig:
+        if self.adapter == "mock_physical" and self.fixture_path is None:
+            raise ValueError("mock_physical requires fixture_path")
+        return self
 
 
 class SimulationCostConfig(DomainModel):

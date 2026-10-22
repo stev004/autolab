@@ -414,6 +414,45 @@ class LabOrchestrator:
             measurement_ids
         ):
             raise DeviceExecutionError("acquisition_measurement_mismatch")
+        measurements_by_id = {item.measurement_id: item for item in response.measurements}
+        for acquisition in response_acquisitions:
+            if acquisition.status != "ok":
+                continue
+            measurement = measurements_by_id[acquisition.acquisition_id]
+            if acquisition.value is None:
+                raise DeviceExecutionError("acquisition_value_missing")
+            try:
+                acquired_value = acquisition.value.to(measurement.unit).value
+            except ValueError as exc:
+                raise DeviceExecutionError("acquisition_unit_mismatch") from exc
+            if (
+                acquired_value != measurement.raw_value
+                or acquisition.vessel_id != measurement.vessel_id
+                or acquisition.measurement_name != measurement.measurement_name
+                or acquisition.acquired_at != measurement.measured_at
+            ):
+                raise DeviceExecutionError("acquisition_measurement_content_mismatch")
+            metadata_checks = {
+                "role": measurement.role.value,
+                "replicate_index": measurement.replicate_index,
+            }
+            for name, expected in metadata_checks.items():
+                if name in acquisition.metadata and acquisition.metadata[name] != expected:
+                    raise DeviceExecutionError(
+                        f"acquisition_measurement_{name}_mismatch"
+                    )
+            if "analyte_level" in acquisition.metadata:
+                acquired_level = acquisition.metadata["analyte_level"]
+                if acquired_level is None or measurement.analyte_level is None:
+                    level_mismatch = acquired_level is not measurement.analyte_level
+                else:
+                    level_mismatch = (
+                        Decimal(str(acquired_level)) != measurement.analyte_level
+                    )
+                if level_mismatch:
+                    raise DeviceExecutionError(
+                        "acquisition_measurement_analyte_level_mismatch"
+                    )
         if isinstance(step.command, MeasureAbsorbanceCommand):
             acquisition_vessels = {item.vessel_id for item in response_acquisitions}
             if len(response_acquisitions) != len(

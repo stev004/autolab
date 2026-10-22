@@ -29,6 +29,7 @@ from autonomous_lab.domain.enums import ParameterScale
 from autonomous_lab.domain.experiments import ExperimentProposal
 from autonomous_lab.domain.quantities import QuantityValue
 from autonomous_lab.hardware.capabilities import CapabilitySnapshot
+from autonomous_lab.hardware.sensors import SensorError, load_sensor_adapter
 from autonomous_lab.human import (
     AcknowledgementDecision,
     DeviationCategory,
@@ -44,6 +45,7 @@ from autonomous_lab.measurement_ingestion import (
     ManualBatchBuilder,
     MeasurementBatchKind,
     MeasurementWorkflowService,
+    ReadOnlySensorSource,
     acquisition_context,
     mock_physical_sensor_source_from_rows,
     parse_measurement_csv,
@@ -425,12 +427,17 @@ def complete_human_execution(
         if run is None or run.status != "running":
             raise HumanWorkflowError("execution start must be recorded first")
         backend = HumanExecutionBackend()
-        session = backend.start(
-            worklist,
+        session = workflow.execution_session(
+            experiment_id,
             operator_id=operator_id,
-            started_at=_as_utc(run.started_at),
         )
+        acknowledged = {item.group_id for item in session.acknowledgements}
         for group in worklist.procedure:
+            if group.group_id in acknowledged:
+                typer.echo(f"\n{group.sequence}. {group.title} — already recorded")
+                continue
+            if session.status.value in {"failed", "aborted"}:
+                break
             typer.echo(f"\n{group.sequence}. {group.title}")
             typer.echo(group.instruction)
             decision = (
@@ -451,6 +458,7 @@ def complete_human_execution(
                 deviations=deviations,
                 note=note,
             )
+            workflow.persist_execution_session(session)
             if session.status.value in {"failed", "aborted"}:
                 break
         record = (
@@ -466,6 +474,41 @@ def complete_human_execution(
     typer.echo(f"human execution recorded: {record.status.value}")
     if record.status.value == "completed":
         typer.echo(f"next: autolab experiment measurements status {experiment_id}")
+
+
+@execution_app.command("status")
+def human_execution_status(
+    experiment_id: Annotated[UUID, typer.Argument(help="Human experiment UUID.")],
+    operator_id: Annotated[str, typer.Option("--operator-id", prompt=True)],
+    database: DatabaseOption = "data/autolab.sqlite3",
+) -> None:
+    """Show durable grouped progress and the next unacknowledged operation."""
+
+    storage = Storage.open(database)
+    try:
+        workflow = HumanWorkflowService(storage)
+        session = workflow.execution_session(experiment_id, operator_id=operator_id)
+        acknowledged = {item.group_id for item in session.acknowledgements}
+        pending = [
+            item for item in session.worklist.procedure if item.group_id not in acknowledged
+        ]
+        payload = {
+            "experiment_id": str(experiment_id),
+            "operator_id": session.operator_id,
+            "status": session.status.value,
+            "acknowledged_groups": len(acknowledged),
+            "total_groups": len(session.worklist.procedure),
+            "next_group": None if not pending else pending[0].title,
+            "uncertain_action_warning": (
+                "If a physical action occurred but was not acknowledged before an "
+                "interruption, do not repeat it automatically; record a deviation or abort."
+            ),
+        }
+    except (HumanWorkflowError, RecordNotFoundError, ValueError) as exc:
+        _abort(str(exc), code=2)
+    finally:
+        storage.close()
+    _emit(payload, json_output=False)
 
 
 @execution_app.command("abort")
@@ -625,19 +668,32 @@ def acquire_sensor_measurements(
         sensor_config = config.execution.sensor
         if config.execution.mode != "human_sensor" or sensor_config is None:
             raise ValueError("experiment is not configured for a read-only sensor")
-        fixture_path = Path(sensor_config.fixture_path).expanduser().resolve()
-        fixture_result = parse_measurement_csv(
-            fixture_path.read_bytes(),
-            plan=plan,
-            submitted_by="mock-sensor-fixture-loader",
-            source_filename=fixture_path.name,
-        )
-        if fixture_result.batch is None:
-            raise MeasurementIngestionError(_format_import_issues(fixture_result.issues))
-        source = mock_physical_sensor_source_from_rows(
-            sensor_config.sensor_id,
-            fixture_result.batch.measurements,
-        )
+        if sensor_config.adapter == "mock_physical":
+            assert sensor_config.fixture_path is not None
+            fixture_path = Path(sensor_config.fixture_path).expanduser().resolve()
+            fixture_result = parse_measurement_csv(
+                fixture_path.read_bytes(),
+                plan=plan,
+                submitted_by="mock-sensor-fixture-loader",
+                source_filename=fixture_path.name,
+            )
+            if fixture_result.batch is None:
+                raise MeasurementIngestionError(
+                    _format_import_issues(fixture_result.issues)
+                )
+            source = mock_physical_sensor_source_from_rows(
+                sensor_config.sensor_id,
+                fixture_result.batch.measurements,
+                fixture_name=fixture_path.name,
+                fixture_sha256=fixture_result.source_file_sha256 or "",
+            )
+        else:
+            sensor = load_sensor_adapter(
+                sensor_config.adapter,
+                sensor_id=sensor_config.sensor_id,
+                settings=sensor_config.settings,
+            )
+            source = ReadOnlySensorSource(sensor)
         acquired_at = datetime.now(UTC)
         batch = asyncio.run(
             source.acquire(
@@ -654,7 +710,13 @@ def acquire_sensor_measurements(
             )
         )
         workflow.submit(batch)
-    except (MeasurementIngestionError, OSError, RecordNotFoundError, ValueError) as exc:
+    except (
+        MeasurementIngestionError,
+        OSError,
+        RecordNotFoundError,
+        SensorError,
+        ValueError,
+    ) as exc:
         _abort(str(exc), code=2)
     finally:
         storage.close()
@@ -904,78 +966,6 @@ def _format_import_issues(issues: tuple[ImportIssue, ...]) -> str:
     )
 
 
-def _mock_sensor_source(
-    sensor_id: str,
-    rows: tuple[RawMeasurement, ...],
-) -> MockPhysicalSensorSource:
-    from autonomous_lab.domain.protocols import QuantityRange
-    from autonomous_lab.hardware.sensors import (
-        CalibrationRecord,
-        MockPhysicalSensor,
-        MockSensorFixture,
-        MockSensorScenario,
-        WavelengthCapabilities,
-    )
-
-    now = datetime.now(UTC)
-    measurement_types = {item.measurement_type for item in rows}
-    if len(measurement_types) != 1:
-        raise ValueError("V0.5 mock optical sensor requires one measurement type")
-    measurement_type = next(iter(measurement_types))
-    wavelength_by_value = {
-        item.wavelength.to("nanometer").value: item.wavelength
-        for item in rows
-        if item.wavelength is not None
-    }
-    wavelengths = tuple(wavelength_by_value[key] for key in sorted(wavelength_by_value))
-    calibration = CalibrationRecord(
-        calibration_id=uuid5(NAMESPACE_URL, f"autolab:{sensor_id}:mock-calibration:1"),
-        sensor_id=sensor_id,
-        measurement_type=measurement_type,
-        calibrated_at=now - timedelta(days=1),
-        expires_at=now + timedelta(days=365),
-        method="zero-hardware fixture calibration",
-        reference_material="mock certified reference",
-        coefficients={"slope": Decimal("1"), "intercept": Decimal("0")},
-        notes="Mock-only calibration; never evidence of a physical calibration.",
-    )
-    sensor = MockPhysicalSensor(
-        sensor_id=sensor_id,
-        scenario=MockSensorScenario(
-            fixtures=tuple(
-                MockSensorFixture(
-                    sample_id=item.sample_id,
-                    measurement_type=item.measurement_type,
-                    value=item.value,
-                    unit=item.unit,
-                    wavelength=item.wavelength,
-                    metadata={"fixture_only": True},
-                )
-                for item in rows
-                if item.value is not None
-            )
-        ),
-        measurement_ranges={
-            measurement_type: QuantityRange(
-                minimum=QuantityValue(value=Decimal("-1"), unit=rows[0].unit),
-                maximum=QuantityValue(value=Decimal("10"), unit=rows[0].unit),
-                resolution=QuantityValue(value=Decimal("0.0001"), unit=rows[0].unit),
-            )
-        },
-        wavelength=(
-            None
-            if not wavelengths
-            else WavelengthCapabilities(discrete_wavelengths=wavelengths)
-        ),
-        calibration=calibration,
-    )
-    return MockPhysicalSensorSource(sensor)
-
-
-def _as_utc(value: datetime) -> datetime:
-    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
-
-
 def _status_payload(status: CampaignStatus) -> dict[str, object]:
     return {
         "campaign_id": str(status.campaign_id),
@@ -984,6 +974,7 @@ def _status_payload(status: CampaignStatus) -> dict[str, object]:
         "experiment_count": status.experiment_count,
         "rejected": status.rejected_count,
         "execution_failed": status.execution_failed_count,
+        "aborted": status.aborted_count,
         "qc_failed": status.qc_failed_count,
         "observed": status.valid_observation_count,
         "feasible": status.feasible_count,

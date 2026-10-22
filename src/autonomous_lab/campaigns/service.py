@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from sqlalchemy import select
@@ -20,7 +20,7 @@ from autonomous_lab.analysis.domain_adapters import (
     derived_metrics_from_analysis,
     readings_from_domain,
 )
-from autonomous_lab.analysis.metrics import AnalysisReading, analyze_assay
+from autonomous_lab.analysis.metrics import analyze_assay
 from autonomous_lab.analysis.pareto import ParetoPoint, pareto_front
 from autonomous_lab.campaigns.config import CampaignConfig, ValidationPolicyConfig
 from autonomous_lab.campaigns.loader import LoadedCampaign
@@ -119,6 +119,7 @@ class CampaignStatus:
     experiment_count: int
     rejected_count: int
     execution_failed_count: int
+    aborted_count: int
     qc_failed_count: int
     valid_observation_count: int
     feasible_count: int
@@ -531,6 +532,7 @@ class CampaignService:
             experiment_count=len(experiments),
             rejected_count=state_counts.get(ExperimentState.REJECTED.value, 0),
             execution_failed_count=state_counts.get(ExperimentState.FAILED.value, 0),
+            aborted_count=state_counts.get(ExperimentState.ABORTED.value, 0),
             qc_failed_count=state_counts.get(ExperimentState.QC_FAILED.value, 0),
             valid_observation_count=len(observations),
             feasible_count=sum(item.feasible for item in observations),
@@ -594,15 +596,15 @@ class CampaignService:
                 .order_by(ExperimentRecord.ordinal, MeasurementRecord.created_at)
                 .limit(1)
             )
-            execution_backends = list(
-                uow.session.scalars(
-                    select(ExecutionRunRecord.backend_name)
+            execution_runs = list(
+                uow.session.execute(
+                    select(ExecutionRunRecord.backend_name, ExecutionRunRecord.status)
                     .join(
                         ExperimentRecord,
                         ExecutionRunRecord.experiment_id == ExperimentRecord.id,
                     )
                     .where(ExperimentRecord.campaign_id == str(campaign_id))
-                )
+                ).all()
             )
             measurement_provenance_rows = list(
                 uow.session.scalars(
@@ -701,6 +703,7 @@ class CampaignService:
             "experiment_count": status.experiment_count,
             "rejected_experiments": status.rejected_count,
             "execution_failures": status.execution_failed_count,
+            "aborted_experiments": status.aborted_count,
             "qc_failures": status.qc_failed_count,
             "valid_observations": status.valid_observation_count,
             "feasible_observations": status.feasible_count,
@@ -716,8 +719,18 @@ class CampaignService:
             "pareto_recipes": pareto_recipes,
             "evidence_origins": {
                 "execution_mode": config.execution.mode,
-                "simulated_device_experiments": execution_backends.count("simulated"),
-                "human_executed_experiments": execution_backends.count("human_operator"),
+                "simulated_device_experiments": sum(
+                    backend == "simulated" and run_status == "succeeded"
+                    for backend, run_status in execution_runs
+                ),
+                "human_executed_experiments": sum(
+                    backend == "human_operator" and run_status == "succeeded"
+                    for backend, run_status in execution_runs
+                ),
+                "human_aborted_experiments": sum(
+                    backend == "human_operator" and run_status == "aborted"
+                    for backend, run_status in execution_runs
+                ),
                 "measurements": _count_measurement_origins(measurement_provenance_rows),
                 "protocol_deviations": sum(
                     len(event.get("deviations", [])) for event in human_events
@@ -972,7 +985,7 @@ class CampaignService:
             uow.commit()
 
         assert evidence is not None
-        evidence_readings = _readings_from_execution_evidence(evidence)
+        evidence_readings = readings_from_domain(execution.measurements)
         qc_report = evaluate_integrity_qc(
             evidence_readings,
             self._qc_config(config),
@@ -1123,6 +1136,14 @@ class CampaignService:
                     )
                     return
                 for item in measurements:
+                    source_metadata = item.metadata.get("source_metadata")
+                    if not isinstance(source_metadata, dict):
+                        source_metadata = {}
+                    source_metadata = cast(dict[str, object], source_metadata)
+                    sensor_evidence = source_metadata.get("sensor_evidence")
+                    if not isinstance(sensor_evidence, dict):
+                        sensor_evidence = {}
+                    sensor_evidence = cast(dict[str, object], sensor_evidence)
                     uow.records.add_measurement(
                         measurement_id=str(item.measurement_id),
                         experiment_id=str(item.experiment_id),
@@ -1144,6 +1165,17 @@ class CampaignService:
                             "revision_id": item.metadata.get("revision_id"),
                             "revision_number": item.metadata.get("revision_number"),
                             "revision_sha256": item.metadata.get("revision_sha256"),
+                            "sensor_id": sensor_evidence.get("sensor_id"),
+                            "sensor_capability_sha256": source_metadata.get(
+                                "sensor_capability_sha256"
+                            ),
+                            "calibration_id": sensor_evidence.get("calibration_id"),
+                            "calibration_sha256": sensor_evidence.get(
+                                "calibration_sha256"
+                            ),
+                            "is_mock": bool(sensor_evidence.get("is_mock", False)),
+                            "fixture_name": source_metadata.get("fixture_name"),
+                            "fixture_sha256": source_metadata.get("fixture_sha256"),
                         },
                         measured_at=item.measured_at,
                         well_id=item.vessel_id,
@@ -1167,6 +1199,14 @@ class CampaignService:
                 DeviationCategory.OPERATOR_ERROR,
                 DeviationCategory.DEVICE_ERROR,
             }
+            or (
+                item.category
+                in {
+                    DeviationCategory.QUANTITY_DEVIATION,
+                    DeviationCategory.TIMING_DEVIATION,
+                }
+                and item.vessel_id is not None
+            )
         )
         if critical:
             qc_report = replace(
@@ -1463,6 +1503,18 @@ class CampaignService:
                 schema_version=result.schema_version,
                 completed_at=result.completed_at,
             )
+            _transition_experiment(
+                uow,
+                result.experiment_id,
+                ExperimentState.MEASURED,
+                ExperimentState.QC_PASSED,
+            )
+            _transition_experiment(
+                uow,
+                result.experiment_id,
+                ExperimentState.QC_PASSED,
+                ExperimentState.ANALYSED,
+            )
             # This row is the durable optimisation outbox.  Scientific evidence,
             # eligibility, and the payload to deliver are committed together.
             uow.optimization.add_observation(
@@ -1476,18 +1528,6 @@ class CampaignService:
                 feasible=observation.feasible,
                 observation=observation,
                 observed_at=observation.observed_at,
-            )
-            _transition_experiment(
-                uow,
-                result.experiment_id,
-                ExperimentState.MEASURED,
-                ExperimentState.QC_PASSED,
-            )
-            _transition_experiment(
-                uow,
-                result.experiment_id,
-                ExperimentState.QC_PASSED,
-                ExperimentState.ANALYSED,
             )
             uow.commit()
 
@@ -1926,40 +1966,6 @@ def _qc_check_snapshots(result: QCResult) -> tuple[dict[str, object], ...]:
     )
 
 
-def _readings_from_execution_evidence(
-    evidence: ExecutionEvidence,
-) -> tuple[AnalysisReading, ...]:
-    """Convert backend-neutral acquisitions into the QC reading contract."""
-
-    readings: list[AnalysisReading] = []
-    for acquisition in evidence.acquisitions:
-        role = acquisition.metadata.get("role")
-        analyte_level = acquisition.metadata.get("analyte_level")
-        acquisition_index = acquisition.metadata.get("acquisition_index")
-        if not isinstance(role, str) or not role:
-            raise CampaignExecutionError("execution acquisition has no scientific role")
-        if isinstance(analyte_level, bool) or not isinstance(analyte_level, (Decimal, int, float)):
-            raise CampaignExecutionError("execution acquisition has invalid analyte level")
-        if isinstance(acquisition_index, bool) or not isinstance(acquisition_index, int):
-            raise CampaignExecutionError("execution acquisition has invalid acquisition index")
-        response = (
-            None
-            if acquisition.value is None
-            else float(acquisition.value.to("dimensionless").value)
-        )
-        readings.append(
-            AnalysisReading(
-                measurement_id=str(acquisition.acquisition_id),
-                role=role,
-                concentration=float(analyte_level),
-                response=response,
-                acquisition_index=acquisition_index,
-                status=acquisition.status,
-            )
-        )
-    return tuple(readings)
-
-
 def _campaign_evidence_error(evidence: ExecutionEvidence | None) -> str | None:
     if evidence is None:
         return "successful assay execution produced no finalized evidence artifact"
@@ -2111,15 +2117,16 @@ def _human_executed_parameters(
                 values[name] = actual.to(values[name].unit)
     for deviation in record.deviations:
         actual = deviation.actual_quantity
-        if actual is None:
+        if actual is None or deviation.vessel_id is not None:
             continue
         parameter_name: str | None = None
         if deviation.category is DeviationCategory.TIMING_DEVIATION:
             parameter_name = "incubation_time"
         elif deviation.category is DeviationCategory.QUANTITY_DEVIATION:
-            parameter_name = (
-                "reagent_volume" if deviation.material_id == "reagent" else "sample_volume"
-            )
+            parameter_name = {
+                "reagent": "reagent_volume",
+                "sample": "sample_volume",
+            }.get(deviation.material_id or "")
         if parameter_name is not None and actual.is_compatible_with(values[parameter_name]):
             values[parameter_name] = actual.to(values[parameter_name].unit)
     return values
@@ -2147,9 +2154,18 @@ def _count_measurement_origins(
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
     for provenance in rows:
-        source = str(
-            provenance.get("measurement_source")
-            or ("simulated" if provenance.get("simulator_model_version") else "unknown")
+        raw_source = provenance.get("measurement_source")
+        source = (
+            "mock_physical_sensor"
+            if raw_source == "physical_sensor" and provenance.get("is_mock") is True
+            else str(
+                raw_source
+                or (
+                    "simulated"
+                    if provenance.get("simulator_model_version")
+                    else "unknown"
+                )
+            )
         )
         counts[source] = counts.get(source, 0) + 1
     return dict(sorted(counts.items()))

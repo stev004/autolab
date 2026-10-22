@@ -1,5 +1,44 @@
 # AutoLab
 
+[![CI](https://github.com/stev004/autolab/actions/workflows/ci.yml/badge.svg)](https://github.com/stev004/autolab/actions/workflows/ci.yml)
+
+## Why
+
+AutoLab is a platform for closed-loop experimental optimisation: propose, compile a
+protocol, validate, execute, measure, learn. It separates what an optimiser proposes
+from what hardware may execute, so an optimiser or research agent never issues a
+device command. Every step is recorded as a versioned evidence record.
+
+## Quickstart (30 seconds)
+
+Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/). This runs a small
+simulated campaign; no hardware is involved.
+
+```bash
+git clone https://github.com/stev004/autolab.git && cd autolab
+uv sync
+uv run autolab init --database data/autolab.sqlite3
+CID=$(uv run autolab campaign create configs/assay-reagent-reduction.yaml \
+  --database data/autolab.sqlite3 | awk '/created campaign/ {print $3}')
+uv run autolab campaign run "$CID" --max-experiments 3 --database data/autolab.sqlite3
+uv run autolab campaign status "$CID" --database data/autolab.sqlite3
+uv run autolab campaign report "$CID" --database data/autolab.sqlite3
+```
+
+## Status and limitations
+
+- Research software, version 0.5. It is not production software.
+- It runs in simulation, with a human in the loop, and with fixture-backed
+  measurements.
+- There are no real hardware drivers yet. The hardware seam is designed
+  (see [Physical hardware seam](#physical-hardware-seam)) but not implemented.
+- It has not been validated or certified for real laboratory use or safety.
+- `src/autonomous_lab/agents/` is a placeholder: it defines the typed contract for a
+  future research agent, and no agent implementation exists.
+- Requires Python 3.12 or newer.
+
+## Overview
+
 AutoLab is a local, hardware-agnostic platform for reproducible closed-loop
 experimental optimisation. V0.5 can execute the scientific loop in simulation,
 pause for a human operator and external measurements, or acquire fixture-backed
@@ -71,11 +110,11 @@ uv run autolab campaign create configs/assay-reagent-reduction-manual.yaml \
 uv run autolab campaign run <campaign-id> --database data/autolab.sqlite3
 uv run autolab experiment worklist <experiment-id> --database data/autolab.sqlite3
 uv run autolab experiment execution start <experiment-id> \
-  --operator-id steven --database data/autolab.sqlite3
+  --operator-id operator-1 --database data/autolab.sqlite3
 uv run autolab experiment execution complete <experiment-id> \
-  --operator-id steven --database data/autolab.sqlite3
+  --operator-id operator-1 --database data/autolab.sqlite3
 uv run autolab experiment measurements enter <experiment-id> \
-  --operator-id steven --database data/autolab.sqlite3
+  --operator-id operator-1 --database data/autolab.sqlite3
 uv run autolab campaign run <campaign-id> --database data/autolab.sqlite3
 ```
 
@@ -90,7 +129,7 @@ The mock-sensor example replaces only the measurement command:
 uv run autolab campaign create configs/assay-reagent-reduction-mock-sensor.yaml \
   --database data/autolab.sqlite3
 uv run autolab experiment measurements acquire <experiment-id> \
-  --operator-id steven --database data/autolab.sqlite3
+  --operator-id operator-1 --database data/autolab.sqlite3
 ```
 
 Human modes never backfill absent evidence from the assay simulator. Each run may
@@ -119,8 +158,8 @@ the existing command union, and returns device-local evidence fragments. The
 backend's neutral finalizer composes those fragments into `ExecutionEvidence` and
 rejects missing or conflicting facts before success is recorded; devices cannot
 choose experiments or bypass the hash-bound validation receipt. Replacing the
-simulated spectrophotometer therefore does not expose the optimiser—or a future
-research agent—to motors, pumps, transports, manufacturer SDKs, or another device's
+simulated spectrophotometer therefore does not expose the optimiser - or a future
+research agent - to motors, pumps, transports, manufacturer SDKs, or another device's
 private state. See the
 [hardware interface](docs/hardware-interface.md) for adapter obligations.
 

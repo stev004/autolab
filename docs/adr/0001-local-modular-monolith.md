@@ -11,7 +11,7 @@ boundaries.
 ## Rationale
 
 The primary V0 risks are scientific semantics, safety gating, execution failure and
-reproducibility—not horizontal scale. One process permits atomic evidence writes,
+reproducibility - not horizontal scale. One process permits atomic evidence writes,
 deterministic tests and straightforward debugging. Interfaces preserve future
 extraction points if physical scheduling later requires separate workers.
 

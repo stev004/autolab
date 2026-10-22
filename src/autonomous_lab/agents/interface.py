@@ -1,5 +1,8 @@
 """Capability-limited interface for a future LLM or research agent.
 
+PLACEHOLDER: this module only defines types and a protocol. No agent implementation
+exists yet, and nothing in the application calls it.
+
 The objects in this module are scientific documents, never device commands.  An
 agent implementation can propose a campaign or interpret a completed summary,
 but the application service must still validate the draft and owns every later

@@ -57,7 +57,14 @@ invalid or expired calibration, malformed responses, disconnection, and timeout.
 An `OpenColorimeterAdapter` belongs at this seam. It must not calculate QC, fit a
 calibration curve, know campaign objectives, access optimiser state, control liquid
 handling, or import simulation. `MockPhysicalSensor` is a fixture-backed contract
-test—not an emulation of the hidden assay world and never proof that hardware ran.
+test - not an emulation of the hidden assay world and never proof that hardware ran.
+
+Real sensor adapters are discovered through the
+`autonomous_lab.sensor_adapters` Python entry-point group. An adapter distribution
+exports a factory accepting `sensor_id` and adapter-owned `settings` and returning a
+`ReadOnlySensor`; campaign configuration then uses `measurement_source:
+physical_sensor`. This keeps vendor dependencies outside AutoLab and requires no
+changes to campaign execution, QC, analysis, storage, or optimisation.
 
 ## Future actuation
 

@@ -9,6 +9,7 @@ from alembic.config import Config
 from sqlalchemy import inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
+from autonomous_lab.domain.state_machines import InvalidStateTransition
 from autonomous_lab.storage import (
     ArtifactStore,
     Database,
@@ -199,6 +200,27 @@ def test_full_scientific_record_is_reconstructable(database: Database) -> None:
             seed=7,
             config={"seed": 7},
         )
+        uow.records.add_experiment_result(
+            result_id="00000000-0000-0000-0000-000000000010",
+            experiment_id=experiment_id,
+            run_id=run.id,
+            qc_run_id=qc_run.id,
+            result={"schema_version": "1", "optimizer_eligible": True},
+            optimizer_eligible=True,
+        )
+        for previous, target in (
+            ("proposed", "validated"),
+            ("validated", "queued"),
+            ("queued", "running"),
+            ("running", "measured"),
+            ("measured", "qc_passed"),
+            ("qc_passed", "analysed"),
+        ):
+            uow.experiments.transition(
+                experiment_id,
+                target,
+                expected_state=previous,
+            )
         uow.optimization.add_observation(
             optimizer_run_id=optimizer.id,
             experiment_id=experiment_id,
@@ -214,7 +236,7 @@ def test_full_scientific_record_is_reconstructable(database: Database) -> None:
             ordinal=1,
             state={"observed_trial_ids": ["trial-0"]},
         )
-        uow.experiments.transition(experiment_id, "OBSERVED", expected_state="PROPOSED")
+        uow.experiments.transition(experiment_id, "observed", expected_state="analysed")
         uow.commit()
 
     with UnitOfWork(database) as uow:
@@ -299,10 +321,63 @@ def test_state_guards_and_audit_are_atomic(database: Database) -> None:
             "campaign.state_changed",
         ]
 
+    with pytest.raises(InvalidStateTransition), UnitOfWork(database) as uow:
+        uow.campaigns.transition(campaign_id, "completed", expected_state="ready")
+
 
 def test_optimizer_observation_is_exactly_once(database: Database) -> None:
     campaign_id, experiment_id = _add_campaign_and_experiment(database)
     with UnitOfWork(database) as uow:
+        protocol = uow.records.add_protocol(
+            protocol_id="00000000-0000-0000-0000-000000000021",
+            experiment_id=experiment_id,
+            schema_version="1",
+            protocol={"steps": []},
+            compiler_name="test",
+            compiler_version="1",
+        )
+        validation = uow.records.add_validation_report(
+            report_id="00000000-0000-0000-0000-000000000022",
+            protocol_id=protocol.id,
+            status="PASSED",
+            protocol_hash=protocol.protocol_hash,
+            capability_snapshot={},
+            validation_policy={},
+            validator_version="1",
+        )
+        run = uow.records.begin_execution(
+            run_id="00000000-0000-0000-0000-000000000023",
+            experiment_id=experiment_id,
+            protocol_id=protocol.id,
+            validation_report_id=validation.id,
+            backend_name="test",
+        )
+        qc_run = uow.records.add_qc_run(
+            qc_run_id="00000000-0000-0000-0000-000000000024",
+            experiment_id=experiment_id,
+            run_id=run.id,
+            status="PASSED",
+            eligible_for_optimization=True,
+            algorithm_name="test",
+            algorithm_version="1",
+        )
+        uow.records.add_experiment_result(
+            result_id="00000000-0000-0000-0000-000000000025",
+            experiment_id=experiment_id,
+            run_id=run.id,
+            qc_run_id=qc_run.id,
+            result={"schema_version": "1"},
+            optimizer_eligible=True,
+        )
+        for previous, target in (
+            ("proposed", "validated"),
+            ("validated", "queued"),
+            ("queued", "running"),
+            ("running", "measured"),
+            ("measured", "qc_passed"),
+            ("qc_passed", "analysed"),
+        ):
+            uow.experiments.transition(experiment_id, target, expected_state=previous)
         optimizer = uow.optimization.add_run(
             optimizer_run_id="00000000-0000-0000-0000-000000000020",
             campaign_id=campaign_id,
@@ -329,6 +404,31 @@ def test_optimizer_observation_is_exactly_once(database: Database) -> None:
     with UnitOfWork(database) as uow:
         assert uow.session is not None
         assert uow.session.scalar(select(OptimizerObservationRecord.id)) is None
+
+
+def test_optimizer_rejects_fabricated_observation_without_scientific_evidence(
+    database: Database,
+) -> None:
+    campaign_id, experiment_id = _add_campaign_and_experiment(database)
+    with pytest.raises(ValueError, match="analysed experiment"), UnitOfWork(database) as uow:
+        optimizer = uow.optimization.add_run(
+            optimizer_run_id="00000000-0000-0000-0000-000000000026",
+            campaign_id=campaign_id,
+            strategy_name="random",
+            strategy_version="1",
+            seed=1,
+            config={},
+        )
+        uow.optimization.add_observation(
+            optimizer_run_id=optimizer.id,
+            experiment_id=experiment_id,
+            trial_id="trial-0",
+            objective_values={"cost": 0.0},
+            constraint_residuals={},
+            qc_eligible=True,
+            feasible=True,
+            observation={"forged": True},
+        )
 
 
 def test_sqlite_pragmas_foreign_keys_and_wal(database: Database) -> None:

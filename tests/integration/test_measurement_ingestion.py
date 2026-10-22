@@ -6,6 +6,7 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
+from sqlalchemy import text
 
 from autonomous_lab.domain.enums import MeasurementRole
 from autonomous_lab.domain.quantities import QuantityValue
@@ -94,7 +95,7 @@ def _add_plan(database: Database):
 
 
 def _complete_initial(plan):
-    builder = ManualBatchBuilder(plan, "steven", submitted_at=NOW)
+    builder = ManualBatchBuilder(plan, "operator-1", submitted_at=NOW)
     builder.set_value("measure:B01", Decimal("0.031"), measured_at=NOW)
     builder.set_value("measure:B02", Decimal("0.029"), measured_at=NOW)
     result = builder.finalize()
@@ -114,7 +115,7 @@ def test_revision_chain_preserves_original_and_projects_only_active_values(
 
     correction = ManualBatchBuilder(
         plan,
-        "steven",
+        "operator-1",
         batch_kind=MeasurementBatchKind.CORRECTION,
         submitted_at=datetime(2026, 8, 14, 19, 0, tzinfo=UTC),
     )
@@ -138,7 +139,7 @@ def test_revision_chain_preserves_original_and_projects_only_active_values(
         assert [item.revision_number for item in history] == [1, 2]
         assert len(active) == 2
         assert projected[0].raw_value == Decimal("0.0031")
-        assert projected[0].device_id == "manual-entry:steven"
+        assert projected[0].device_id == "manual-entry:operator-1"
         assert projected[0].metadata["supersedes_revision_id"] == original_id
         assert projected[0].metadata["measurement_source"] == "manual_entry"
 
@@ -156,7 +157,7 @@ def test_raw_revisions_are_immutable(database: Database) -> None:
 
 def test_incomplete_or_unavailable_plan_cannot_be_projected(database: Database) -> None:
     plan = _add_plan(database)
-    builder = ManualBatchBuilder(plan, "steven", submitted_at=NOW)
+    builder = ManualBatchBuilder(plan, "operator-1", submitted_at=NOW)
     builder.set_value("measure:B01", Decimal("0.031"), measured_at=NOW)
     builder.set_unavailable("measure:B02", "sample spilled", measured_at=NOW)
     result = builder.finalize()
@@ -228,7 +229,7 @@ def test_high_precision_manual_decimal_survives_float_index_projection(
 ) -> None:
     plan = _add_plan(database)
     precise = Decimal("0.0310000000000000000000000001")
-    builder = ManualBatchBuilder(plan, "steven", submitted_at=NOW)
+    builder = ManualBatchBuilder(plan, "operator-1", submitted_at=NOW)
     builder.set_value("measure:B01", precise, measured_at=NOW)
     builder.set_value("measure:B02", Decimal("0.029"), measured_at=NOW)
     batch = builder.finalize().batch
@@ -241,3 +242,24 @@ def test_high_precision_manual_decimal_survives_float_index_projection(
         projected = uow.measurement_ingestion.active_measurements(EXPERIMENT_ID, RUN_ID)
         assert revisions[0].value_decimal == str(precise)
         assert projected[0].raw_value == precise
+
+
+def test_projection_rejects_direct_sql_tampering_with_exact_value(
+    database: Database,
+) -> None:
+    plan = _add_plan(database)
+    with UnitOfWork(database) as uow:
+        uow.measurement_ingestion.add_batch(_complete_initial(plan))
+        uow.commit()
+    with database.engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE external_measurement_revisions "
+                "SET value_decimal = '9.99' WHERE expected_measurement_id = 'measure:B01'"
+            )
+        )
+
+    with UnitOfWork(database) as uow, pytest.raises(
+        MeasurementIngestionError, match="SHA-256"
+    ):
+        uow.measurement_ingestion.active_measurements(EXPERIMENT_ID, RUN_ID)

@@ -20,7 +20,7 @@ from autonomous_lab.measurement_ingestion.models import (
     RawMeasurementBatch,
 )
 from autonomous_lab.measurement_ingestion.validation import reconcile_measurements
-from autonomous_lab.provenance.hashing import canonical_sha256
+from autonomous_lab.provenance.hashing import canonical_json, canonical_sha256
 from autonomous_lab.storage._serialization import jsonable
 from autonomous_lab.storage.orm import (
     AuditEventRecord,
@@ -176,7 +176,9 @@ class MeasurementIngestionRepository:
             source_file_sha256=batch.source_file_sha256,
             source_filename=batch.source_filename,
             batch_sha256=batch.batch_sha256,
-            batch_snapshot=jsonable(batch),
+            # Generic SQLite JSON conversion would round Decimal values to
+            # binary floats. Canonical snapshots preserve their exact text.
+            batch_snapshot=json.loads(canonical_json(batch)),
             created_at=utc_now(),
         )
         self.session.add(batch_record)
@@ -203,6 +205,11 @@ class MeasurementIngestionRepository:
                 "supersedes_revision_id": None if active is None else active.id,
                 "raw_measurement": row.model_dump(mode="python"),
                 "source_type": batch.source_type,
+                "value_decimal": None if row.value is None else str(row.value),
+                "availability": row.availability.value,
+                "unit": row.unit,
+                "measured_at": row.measured_at,
+                "correction_reason": row.correction_reason,
             }
             revision = ExternalMeasurementRevisionRecord(
                 id=revision_id,
@@ -220,7 +227,7 @@ class MeasurementIngestionRepository:
                 measured_at=row.measured_at,
                 correction_reason=row.correction_reason,
                 revision_sha256=canonical_sha256(revision_values),
-                raw_snapshot=jsonable(row),
+                raw_snapshot=json.loads(canonical_json(row)),
                 created_at=batch.submitted_at,
             )
             self.session.add(revision)
@@ -319,14 +326,69 @@ class MeasurementIngestionRepository:
             revision = active.get(expected.expected_measurement_id)
             if revision is None or revision.availability != MeasurementAvailability.AVAILABLE.value:
                 continue
-            raw = RawMeasurement.model_validate_json(json.dumps(revision.raw_snapshot))
-            if revision.value_decimal is not None:
-                raw = raw.model_copy(update={"value": Decimal(revision.value_decimal)})
+            raw = _raw_measurement_from_snapshot(revision.raw_snapshot)
+            if (
+                revision.availability != raw.availability.value
+                or revision.unit != raw.unit
+                or revision.measured_at.replace(tzinfo=None)
+                != raw.measured_at.replace(tzinfo=None)
+                or revision.correction_reason != raw.correction_reason
+            ):
+                raise MeasurementIngestionError(
+                    f"measurement revision {revision.id} conflicts with its hashed snapshot"
+                )
             assert raw.value is not None
             batch = self.session.get(MeasurementIngestionBatchRecord, revision.batch_id)
             if batch is None:
                 raise MeasurementIngestionError(f"batch {revision.batch_id} does not exist")
             source = MeasurementSourceType(revision.source_type)
+            batch_model = _raw_batch_from_snapshot(batch.batch_snapshot)
+            if (
+                str(batch_model.batch_id) != batch.id
+                or batch_model.batch_sha256 != batch.batch_sha256
+                or str(batch_model.experiment_id) != batch.experiment_id
+                or str(batch_model.plan_id) != batch.plan_id
+                or batch_model.source_type is not source
+                or canonical_sha256(batch_model, exclude={"batch_sha256"})
+                != batch.batch_sha256
+            ):
+                raise MeasurementIngestionError(
+                    f"measurement batch {batch.id} conflicts with its hashed snapshot"
+                )
+            batch_raw = next(
+                (
+                    item
+                    for item in batch_model.measurements
+                    if item.expected_measurement_id == revision.expected_measurement_id
+                ),
+                None,
+            )
+            if batch_raw is None or canonical_sha256(batch_raw) != canonical_sha256(raw):
+                raise MeasurementIngestionError(
+                    f"measurement revision {revision.id} is not present in its source batch"
+                )
+            revision_values = {
+                "revision_id": revision.id,
+                "batch_sha256": batch.batch_sha256,
+                "expected_measurement_id": revision.expected_measurement_id,
+                "revision_number": revision.revision_number,
+                "supersedes_revision_id": revision.supersedes_revision_id,
+                "raw_measurement": raw.model_dump(mode="python"),
+                "source_type": source,
+                "value_decimal": revision.value_decimal,
+                "availability": revision.availability,
+                "unit": revision.unit,
+                "measured_at": raw.measured_at,
+                "correction_reason": revision.correction_reason,
+            }
+            if canonical_sha256(revision_values) != revision.revision_sha256:
+                raise MeasurementIngestionError(
+                    f"measurement revision {revision.id} failed its SHA-256 check"
+                )
+            if revision.value_decimal is None:
+                raise MeasurementIngestionError(
+                    f"available measurement revision {revision.id} has no exact value"
+                )
             projected.append(
                 Measurement(
                     measurement_id=UUID(revision.id),
@@ -339,7 +401,7 @@ class MeasurementIngestionRepository:
                     analyte_level=expected.analyte_level,
                     replicate_index=expected.replicate_index,
                     measurement_name=expected.measurement_type,
-                    raw_value=raw.value,
+                    raw_value=Decimal(revision.value_decimal),
                     unit=raw.unit,
                     measured_at=raw.measured_at,
                     metadata={
@@ -399,3 +461,35 @@ def _source_identifier(
         return f"file-import:{batch.source_filename}"
     supplied = raw.source_metadata.get("device_id") or raw.source_metadata.get("source_id")
     return f"{source.value}:{supplied or 'unspecified'}"
+
+
+def _raw_measurement_from_snapshot(snapshot: dict[str, object]) -> RawMeasurement:
+    data = dict(snapshot)
+    raw_value = data.get("value")
+    if isinstance(raw_value, str):
+        data["value"] = Decimal(raw_value)
+    wavelength = data.get("wavelength")
+    if isinstance(wavelength, dict):
+        rebound_wavelength = cast(dict[str, object], wavelength.copy())
+        wavelength_value = rebound_wavelength.get("value")
+        if isinstance(wavelength_value, str):
+            rebound_wavelength["value"] = Decimal(wavelength_value)
+        data["wavelength"] = rebound_wavelength
+    return RawMeasurement.model_validate(data, strict=False)
+
+
+def _raw_batch_from_snapshot(snapshot: dict[str, object]) -> RawMeasurementBatch:
+    data = dict(snapshot)
+    rows = data.get("measurements")
+    if not isinstance(rows, list):
+        raise MeasurementIngestionError("measurement batch snapshot has invalid rows")
+    row_values = cast(list[object], rows)
+    rebound_rows: list[RawMeasurement] = []
+    for row in row_values:
+        if not isinstance(row, dict):
+            raise MeasurementIngestionError("measurement batch snapshot has a malformed row")
+        rebound_rows.append(
+            _raw_measurement_from_snapshot(cast(dict[str, object], row))
+        )
+    data["measurements"] = tuple(rebound_rows)
+    return RawMeasurementBatch.model_validate(data, strict=False)

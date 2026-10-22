@@ -6,11 +6,15 @@ import hashlib
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Any, cast
+from uuid import UUID
 
 from sqlalchemy import Integer, func, select
 from sqlalchemy.orm import Session
 
+from autonomous_lab.domain.enums import CampaignState, ExperimentState
+from autonomous_lab.domain.state_machines import transition_campaign, transition_experiment
 from autonomous_lab.storage._serialization import enum_value, jsonable, snapshot_hash
 from autonomous_lab.storage.orm import (
     ActionEventRecord,
@@ -62,12 +66,29 @@ def _now(value: datetime | None) -> datetime:
     return value or utc_now()
 
 
-def _expected_states(value: str | Sequence[str] | None) -> set[str] | None:
+def _state_value(enum_type: type[Enum], value: Any) -> str:
+    """Accept either a stable enum value or its legacy/member-name spelling."""
+
+    raw = enum_value(value)
+    try:
+        return str(enum_type(raw).value)
+    except ValueError:
+        member = enum_type.__members__.get(raw)
+        if member is None:
+            raise ValueError(
+                f"{raw!r} is not a valid {enum_type.__name__}"
+            ) from None
+        return str(member.value)
+
+
+def _expected_states(
+    enum_type: type[Enum], value: str | Sequence[str] | None
+) -> set[str] | None:
     if value is None:
         return None
     if isinstance(value, str):
-        return {value}
-    return {enum_value(item) for item in value}
+        return {_state_value(enum_type, value)}
+    return {_state_value(enum_type, item) for item in value}
 
 
 @dataclass(frozen=True)
@@ -115,7 +136,7 @@ class CampaignRepository:
         record = CampaignRecord(
             id=str(campaign_id),
             name=name,
-            state=enum_value(state),
+            state=_state_value(CampaignState, state),
             schema_version=schema_version,
             config_source=config_source,
             config_json=config_snapshot,
@@ -179,15 +200,21 @@ class CampaignRepository:
         occurred_at: datetime | None = None,
     ) -> CampaignRecord:
         record = self.get(campaign_id)
-        expected = _expected_states(expected_state)
+        expected = _expected_states(CampaignState, expected_state)
         if expected is not None and record.state not in expected:
             raise StateConflictError(
                 f"campaign {campaign_id} is {record.state!r}, expected one of {sorted(expected)!r}"
             )
-        target = enum_value(new_state)
+        target = _state_value(CampaignState, new_state)
         previous = record.state
         if previous == target:
             return record
+        transition_campaign(
+            UUID(record.id),
+            CampaignState(previous),
+            CampaignState(target),
+            reason=reason,
+        )
         timestamp = _now(occurred_at)
         record.state = target
         record.updated_at = timestamp
@@ -275,7 +302,7 @@ class ExperimentRepository:
             id=str(experiment_id),
             campaign_id=str(campaign_id),
             ordinal=ordinal,
-            state=enum_value(state),
+            state=_state_value(ExperimentState, state),
             optimizer_trial_id=optimizer_trial_id,
             created_at=timestamp,
             updated_at=timestamp,
@@ -329,16 +356,22 @@ class ExperimentRepository:
         occurred_at: datetime | None = None,
     ) -> ExperimentRecord:
         record = self.get(experiment_id)
-        expected = _expected_states(expected_state)
+        expected = _expected_states(ExperimentState, expected_state)
         if expected is not None and record.state not in expected:
             raise StateConflictError(
                 f"experiment {experiment_id} is {record.state!r}, "
                 f"expected one of {sorted(expected)!r}"
             )
-        target = enum_value(new_state)
+        target = _state_value(ExperimentState, new_state)
         previous = record.state
         if previous == target:
             return record
+        transition_experiment(
+            UUID(record.id),
+            ExperimentState(previous),
+            ExperimentState(target),
+            reason=reason,
+        )
         timestamp = _now(occurred_at)
         record.state = target
         record.updated_at = timestamp
@@ -912,6 +945,34 @@ class OptimizerRepository:
         completed experiment cannot be reported to the optimizer twice.
         """
 
+        # Related scientific evidence may have been appended earlier in the
+        # same unit of work while SQLAlchemy autoflush is intentionally off.
+        self.session.flush()
+        run = self.get_run(optimizer_run_id)
+        experiment = _required(self.session, ExperimentRecord, str(experiment_id))
+        if run.campaign_id != experiment.campaign_id:
+            raise ValueError("optimizer run and experiment belong to different campaigns")
+        if experiment.state != ExperimentState.ANALYSED.value:
+            raise ValueError("optimizer observations require an analysed experiment")
+        if experiment.optimizer_trial_id not in {None, str(trial_id)}:
+            raise ValueError("optimizer observation trial differs from experiment trial")
+        if not qc_eligible:
+            raise ValueError("an optimizer observation must be QC eligible")
+        result = self.session.scalar(
+            select(ExperimentResultRecord).where(
+                ExperimentResultRecord.experiment_id == experiment.id,
+                ExperimentResultRecord.optimizer_eligible.is_(True),
+            )
+        )
+        if result is None or result.qc_run_id is None:
+            raise ValueError("optimizer observation requires an eligible experiment result")
+        qc_run = self.session.get(QCRunRecord, result.qc_run_id)
+        if (
+            qc_run is None
+            or qc_run.status.lower() != "passed"
+            or not qc_run.eligible_for_optimization
+        ):
+            raise ValueError("optimizer observation requires a passing eligible QC run")
         record = OptimizerObservationRecord(
             id=str(observation_id or uuid_string()),
             optimizer_run_id=str(optimizer_run_id),

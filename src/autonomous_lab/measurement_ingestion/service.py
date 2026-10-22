@@ -45,6 +45,9 @@ class MeasurementWorkflowService:
                 ("human_sensor", "mock_physical_sensor"): {
                     MeasurementSourceType.PHYSICAL_SENSOR
                 },
+                ("human_sensor", "physical_sensor"): {
+                    MeasurementSourceType.PHYSICAL_SENSOR
+                },
             }.get((str(mode), str(configured_source)), set())
             if batch.source_type not in allowed_sources:
                 raise MeasurementIngestionError(
@@ -63,15 +66,26 @@ class MeasurementWorkflowService:
             plan_record = uow.measurement_ingestion.latest_plan(experiment.id)
             plan = ExpectedMeasurementPlan.model_validate(plan_record.plan_snapshot, strict=False)
             active = {
-                row.expected_measurement_id
+                row.expected_measurement_id: row
                 for row in uow.measurement_ingestion.active_revisions(experiment.id)
             }
             required = {row.expected_measurement_id for row in plan.entries if row.required}
-            if not required.issubset(active):
+            received = set(active)
+            if (
+                not required.issubset(received)
+                and batch.batch_kind is MeasurementBatchKind.INITIAL
+            ):
                 raise MeasurementIngestionError(
                     "measurement submission did not reconcile every required plan entry"
                 )
-            if experiment.state == ExperimentState.AWAITING_MEASUREMENTS.value:
+            all_required_available = all(
+                identifier in active and active[identifier].availability == "available"
+                for identifier in required
+            )
+            if (
+                experiment.state == ExperimentState.AWAITING_MEASUREMENTS.value
+                and all_required_available
+            ):
                 transition_experiment(
                     batch.experiment_id,
                     ExperimentState.AWAITING_MEASUREMENTS,

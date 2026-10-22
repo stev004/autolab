@@ -54,7 +54,7 @@ def _plan():
 
 def test_manual_builder_allows_draft_correction_then_finalizes_complete_batch() -> None:
     plan = _plan()
-    builder = ManualBatchBuilder(plan, "steven", submitted_at=NOW)
+    builder = ManualBatchBuilder(plan, "operator-1", submitted_at=NOW)
     builder.set_value("measure:B01", Decimal("0.31"), measured_at=NOW)
     builder.set_value("measure:B01", Decimal("0.031"), measured_at=NOW, note="draft fix")
     builder.set_value("measure:B02", Decimal("0.029"), measured_at=NOW)
@@ -92,7 +92,7 @@ def test_canonical_csv_is_accepted_with_raw_file_hash() -> None:
     result = parse_measurement_csv(
         content,
         plan=_plan(),
-        submitted_by="steven",
+        submitted_by="operator-1",
         source_filename="readings.csv",
         submitted_at=NOW,
     )

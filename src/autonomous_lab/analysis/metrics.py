@@ -6,6 +6,7 @@ import math
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -14,7 +15,9 @@ from autonomous_lab.analysis.uncertainty import (
     UncertaintyEstimate,
     difference_of_means_uncertainty,
 )
-from autonomous_lab.simulation.assay_model import AssayBatch
+
+if TYPE_CHECKING:
+    from autonomous_lab.simulation.assay_model import AssayBatch
 
 
 @dataclass(frozen=True, slots=True)

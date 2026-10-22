@@ -79,7 +79,9 @@ method, reference material, coefficients/parameters, optional raw artifact hash,
 lifecycle status, supersession, and a canonical record hash. The sensor rejects a
 missing, expired, invalidated, superseded, or mismatched calibration before returning
 a reading. Capability manifests and raw sensor evidence embed calibration references
-and hashes.
+and hashes. Every accepted sensor row also freezes the point-in-time capability
+manifest, self-test result, source evidence, and (for the shipped mock) complete
+calibration record plus its SHA-256 - not merely mutable foreign keys.
 
 The first real optical adapter needs to implement only:
 
@@ -94,8 +96,35 @@ The first real optical adapter needs to implement only:
 
 It must not interpret the assay, run QC/analysis, know optimiser state/objectives,
 control pumps, or access simulator coefficients. A real adapter therefore slots into
-`MockPhysicalSensorSource`'s `ReadOnlySensor` dependency without changes above the
+`ReadOnlySensorSource`'s `ReadOnlySensor` dependency without changes above the
 measurement-source layer.
+
+Package the adapter as an independent Python distribution and publish a callable
+entry point named for the configured adapter:
+
+```toml
+[project.entry-points."autonomous_lab.sensor_adapters"]
+open_colorimeter = "my_open_colorimeter.adapter:create_sensor"
+```
+
+The callable signature is `create_sensor(*, sensor_id: str, settings: dict) ->
+ReadOnlySensor`. Then select it without changing campaign, optimiser, QC, or analysis
+code:
+
+```yaml
+execution:
+  mode: human_sensor
+  capability_profile: human_assay_v1
+  measurement_source: physical_sensor
+  sensor:
+    adapter: open_colorimeter
+    sensor_id: lab-optical-001
+    settings: {port: /dev/ttyUSB0}
+```
+
+Only the adapter package owns transport and vendor parsing. AutoLab owns request
+identity, timeouts, capability/calibration checks, lifecycle evidence, reconciliation,
+QC, and downstream learning.
 
 ## Honest limitations
 
@@ -109,6 +138,10 @@ measurement-source layer.
   unattended physical interlocks.
 - Calibration records are modelled and hashed, but V0.5 does not perform a real
   calibration protocol or certify reference materials.
+- The ORM rejects application-level mutation of raw evidence and read paths recheck
+  hashes, including exact decimal scalars. SQLite remains a local trusted store, not
+  a signed or access-controlled append-only ledger; a privileged actor who rewrites
+  both data and every matching hash is outside V0.5's threat model.
 
 These are deliberate constraints. Missing physical evidence stays missing and is
 never replaced by simulation.

@@ -22,6 +22,7 @@ from autonomous_lab.hardware.sensors.contracts import (
     WavelengthCapabilities,
 )
 from autonomous_lab.hardware.sensors.errors import (
+    SensorAdapterError,
     SensorCalibrationError,
     SensorCapabilityError,
     SensorConnectionError,
@@ -36,8 +37,15 @@ from autonomous_lab.hardware.sensors.mock import (
     MockSensorScenario,
     fixed_clock,
 )
+from autonomous_lab.hardware.sensors.registry import (
+    SENSOR_ADAPTER_ENTRY_POINT_GROUP,
+    SensorAdapterFactory,
+    SensorAdapterRegistry,
+    load_sensor_adapter,
+)
 
 __all__ = [
+    "SENSOR_ADAPTER_ENTRY_POINT_GROUP",
     "CalibrationIssue",
     "CalibrationRecord",
     "CalibrationReference",
@@ -53,6 +61,9 @@ __all__ = [
     "SelfTestCheck",
     "SelfTestResult",
     "SelfTestStatus",
+    "SensorAdapterError",
+    "SensorAdapterFactory",
+    "SensorAdapterRegistry",
     "SensorCalibrationError",
     "SensorCapabilities",
     "SensorCapabilityError",
@@ -65,5 +76,6 @@ __all__ = [
     "SensorSourceEvidence",
     "WavelengthCapabilities",
     "fixed_clock",
+    "load_sensor_adapter",
     "validate_calibration",
 ]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol, runtime_checkable
@@ -16,11 +17,17 @@ from autonomous_lab.domain.protocols import QuantityRange
 from autonomous_lab.domain.quantities import QuantityValue
 from autonomous_lab.hardware.sensors import (
     CalibrationRecord,
+    CalibrationStatus,
     MeasurementRequest,
     MockPhysicalSensor,
     MockSensorFixture,
     MockSensorScenario,
     ReadOnlySensor,
+    SensorCalibrationError,
+    SensorCapabilityError,
+    SensorError,
+    SensorNotReadyError,
+    SensorReadTimeoutError,
     WavelengthCapabilities,
 )
 from autonomous_lab.measurement_ingestion.csv_import import parse_measurement_csv
@@ -131,13 +138,19 @@ class SimulatedMeasurementSource:
         return self.batch
 
 
-class MockPhysicalSensorSource:
-    """Acquire plan entries through the real sensor contract using a mock adapter."""
+class ReadOnlySensorSource:
+    """Acquire a raw batch through any conforming read-only sensor adapter."""
 
     source_type = MeasurementSourceType.PHYSICAL_SENSOR
 
-    def __init__(self, sensor: ReadOnlySensor) -> None:
+    def __init__(
+        self,
+        sensor: ReadOnlySensor,
+        *,
+        source_metadata: dict[str, object] | None = None,
+    ) -> None:
         self.sensor = sensor
+        self.source_metadata = dict(source_metadata or {})
 
     async def acquire(
         self,
@@ -146,32 +159,136 @@ class MockPhysicalSensorSource:
     ) -> RawMeasurementBatch:
         if context.experiment_id != plan.experiment_id:
             raise ValueError("acquisition context does not match measurement plan")
-        await self.sensor.open()
+        connection = await self.sensor.open()
         try:
+            capabilities = await self.sensor.capability_manifest()
+            if capabilities.sensor_id != self.sensor.sensor_id:
+                raise SensorError(
+                    "sensor_capability_identity_mismatch",
+                    "sensor capability identity changed during acquisition",
+                )
+            calibration_by_type = {
+                item.measurement_type: item for item in capabilities.calibrations
+            }
+            if capabilities.calibration_required:
+                for measurement_type in {item.measurement_type for item in plan.entries}:
+                    calibration = calibration_by_type.get(measurement_type)
+                    if calibration is None:
+                        raise SensorCalibrationError(
+                            "calibration_missing",
+                            f"sensor has no calibration for {measurement_type!r}",
+                        )
+                    if calibration.status is not CalibrationStatus.VALID:
+                        raise SensorCalibrationError(
+                            f"calibration_{calibration.status.value}",
+                            f"sensor calibration is {calibration.status.value}",
+                        )
             self_test = await self.sensor.self_test()
+            if self_test.sensor_id != self.sensor.sensor_id:
+                raise SensorError(
+                    "sensor_self_test_identity_mismatch",
+                    "sensor self-test identity changed during acquisition",
+                )
             if self_test.status.value != "passed":
-                raise RuntimeError("sensor self-test failed")
+                raise SensorNotReadyError("sensor self-test failed")
             readings: list[RawMeasurement] = []
             for expected in plan.entries:
-                result = await self.sensor.read(
-                    MeasurementRequest(
-                        experiment_id=context.experiment_id,
-                        run_id=context.run_id,
-                        sample_id=expected.sample_id,
-                        measurement_type=expected.measurement_type,
-                        expected_unit=expected.unit,
-                        wavelength=expected.wavelength,
-                        requested_at=context.acquired_at,
+                if expected.measurement_type not in capabilities.measurement_types:
+                    raise SensorCapabilityError(
+                        f"sensor does not support {expected.measurement_type!r}"
                     )
+                allowed_range = capabilities.measurement_ranges[
+                    expected.measurement_type
+                ]
+                try:
+                    allowed_minimum = allowed_range.minimum.to(expected.unit).value
+                    allowed_maximum = allowed_range.maximum.to(expected.unit).value
+                except ValueError as exc:
+                    raise SensorCapabilityError(
+                        f"sensor range is incompatible with requested unit {expected.unit!r}"
+                    ) from exc
+                if expected.wavelength is not None and (
+                    capabilities.wavelength is None
+                    or not capabilities.wavelength.supports(expected.wavelength)
+                ):
+                    raise SensorCapabilityError(
+                        "sensor does not support the requested wavelength"
+                    )
+                request = MeasurementRequest(
+                    experiment_id=context.experiment_id,
+                    run_id=context.run_id,
+                    sample_id=expected.sample_id,
+                    measurement_type=expected.measurement_type,
+                    expected_unit=expected.unit,
+                    wavelength=expected.wavelength,
+                    requested_at=context.acquired_at,
                 )
+                try:
+                    result = await asyncio.wait_for(
+                        self.sensor.read(request),
+                        timeout=float(request.timeout_seconds),
+                    )
+                except SensorReadTimeoutError:
+                    raise
+                except TimeoutError as exc:
+                    raise SensorReadTimeoutError() from exc
                 if (
-                    result.experiment_id != context.experiment_id
+                    result.request_id != request.request_id
+                    or result.experiment_id != context.experiment_id
                     or result.run_id != context.run_id
                     or result.sample_id != expected.sample_id
                     or result.measurement_type != expected.measurement_type
                 ):
-                    raise RuntimeError(
-                        "sensor response identity does not match its measurement request"
+                    raise SensorError(
+                        "sensor_response_identity_mismatch",
+                        "sensor response identity does not match its measurement request",
+                    )
+                evidence = result.source_evidence
+                if (
+                    evidence.sensor_id != self.sensor.sensor_id
+                    or evidence.connection_session_id != connection.session_id
+                    or evidence.self_test_id != self_test.self_test_id
+                ):
+                    raise SensorError(
+                        "sensor_lifecycle_evidence_mismatch",
+                        "sensor response lifecycle evidence is inconsistent",
+                    )
+                if evidence.capability_sha256 != capabilities.sha256:
+                    raise SensorError(
+                        "sensor_capability_hash_mismatch",
+                        "sensor response capability hash changed during acquisition",
+                    )
+                if capabilities.calibration_required:
+                    calibration = calibration_by_type[expected.measurement_type]
+                    if (
+                        evidence.calibration_id != calibration.calibration_id
+                        or evidence.calibration_sha256
+                        != calibration.calibration_sha256
+                    ):
+                        raise SensorCalibrationError(
+                            "calibration_evidence_mismatch",
+                            "sensor response calibration differs from its capability snapshot",
+                        )
+                if result.unit != expected.unit:
+                    raise SensorError(
+                        "sensor_response_unit_mismatch",
+                        "sensor response unit differs from its request",
+                    )
+                expected_wavelength = expected.wavelength
+                if (result.wavelength is None) != (expected_wavelength is None) or (
+                    result.wavelength is not None
+                    and expected_wavelength is not None
+                    and result.wavelength.to("nanometer").value
+                    != expected_wavelength.to("nanometer").value
+                ):
+                    raise SensorError(
+                        "sensor_response_wavelength_mismatch",
+                        "sensor response wavelength differs from its request",
+                    )
+                if not allowed_minimum <= result.raw_value <= allowed_maximum:
+                    raise SensorError(
+                        "sensor_response_out_of_range",
+                        "sensor response is outside its frozen capability range",
                     )
                 readings.append(
                     RawMeasurement(
@@ -186,7 +303,14 @@ class MockPhysicalSensorSource:
                         source_metadata={
                             "device_id": result.source_evidence.sensor_id,
                             "raw_measurement_id": str(result.raw_measurement_id),
-                            "sensor_evidence": result.source_evidence.model_dump(mode="json"),
+                            "sensor_capability_manifest": capabilities.model_dump(
+                                mode="json"
+                            ),
+                            "sensor_capability_sha256": capabilities.sha256,
+                            "sensor_self_test": self_test.model_dump(mode="json"),
+                            "sensor_evidence": evidence.model_dump(mode="json"),
+                            "sensor_response_metadata": result.metadata,
+                            **self.source_metadata,
                         },
                     )
                 )
@@ -203,16 +327,25 @@ class MockPhysicalSensorSource:
         )
 
 
+# Compatibility name retained for existing V0.5 callers. The implementation is
+# generic and accepts any ReadOnlySensor, not only the mock fixture adapter.
+MockPhysicalSensorSource = ReadOnlySensorSource
+
+
 def mock_physical_sensor_source_from_rows(
     sensor_id: str,
     rows: tuple[RawMeasurement, ...],
     *,
+    fixture_name: str,
+    fixture_sha256: str,
     now: datetime | None = None,
-) -> MockPhysicalSensorSource:
+) -> ReadOnlySensorSource:
     """Build the explicit zero-hardware sensor boundary from external fixture rows."""
 
     if not rows:
         raise ValueError("mock optical sensor requires at least one fixture row")
+    if not fixture_name.strip() or len(fixture_sha256) != 64:
+        raise ValueError("mock sensor fixture name and SHA-256 are required")
     at = now or datetime.now(UTC)
     measurement_types = {item.measurement_type for item in rows}
     if len(measurement_types) != 1:
@@ -245,7 +378,11 @@ def mock_physical_sensor_source_from_rows(
                     value=item.value,
                     unit=item.unit,
                     wavelength=item.wavelength,
-                    metadata={"fixture_only": True},
+                    metadata={
+                        "fixture_only": True,
+                        "fixture_name": fixture_name,
+                        "fixture_sha256": fixture_sha256,
+                    },
                 )
                 for item in rows
                 if item.value is not None
@@ -265,7 +402,16 @@ def mock_physical_sensor_source_from_rows(
         ),
         calibration=calibration,
     )
-    return MockPhysicalSensorSource(sensor)
+    return ReadOnlySensorSource(
+        sensor,
+        source_metadata={
+            "fixture_only": True,
+            "fixture_name": fixture_name,
+            "fixture_sha256": fixture_sha256,
+            "calibration_record": calibration.model_dump(mode="json"),
+            "calibration_record_sha256": calibration.sha256,
+        },
+    )
 
 
 def acquisition_context(

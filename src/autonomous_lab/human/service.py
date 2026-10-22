@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -11,7 +12,9 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from sqlalchemy import select
 
 from autonomous_lab.domain.enums import ExperimentState
+from autonomous_lab.domain.identifiers import require_utc
 from autonomous_lab.domain.state_machines import transition_experiment
+from autonomous_lab.human.backend import HumanExecutionBackend, HumanExecutionSession
 from autonomous_lab.human.models import ExecutionStatus, HumanExecutionRecord
 from autonomous_lab.human.worklists import (
     OperatorWorklist,
@@ -23,6 +26,7 @@ from autonomous_lab.storage._serialization import jsonable
 from autonomous_lab.storage.artifacts import ArtifactStore
 from autonomous_lab.storage.orm import (
     ArtifactRecord,
+    AuditEventRecord,
     ExecutionRunRecord,
     ExperimentRecord,
     ValidationReportRecord,
@@ -191,6 +195,15 @@ class HumanWorkflowService:
             experiment = uow.experiments.get(str(record.experiment_id))
             if experiment.state != ExperimentState.RUNNING.value:
                 raise HumanWorkflowError(f"experiment must be running, not {experiment.state!r}")
+            assert uow.session is not None
+            execution_run = uow.session.get(ExecutionRunRecord, str(run_id))
+            if execution_run is None:
+                raise HumanWorkflowError("human execution run evidence is missing")
+            started_by = execution_run.device_snapshot.get("operator_id")
+            if started_by != record.operator_id:
+                raise HumanWorkflowError(
+                    "completion operator does not match the operator who started execution"
+                )
             for sequence, evidence in enumerate(record.step_evidence):
                 uow.records.append_action_event(
                     run_id=str(run_id),
@@ -256,6 +269,107 @@ class HumanWorkflowService:
             uow.commit()
         return run_id
 
+    def execution_session(
+        self,
+        experiment_id: UUID,
+        *,
+        operator_id: str,
+    ) -> HumanExecutionSession:
+        """Restore durable grouped acknowledgements for crash-safe CLI resume."""
+
+        worklist = self.load_worklist(experiment_id)
+        with self.storage.unit_of_work() as uow:
+            experiment = uow.experiments.get(str(experiment_id))
+            if experiment.state != ExperimentState.RUNNING.value:
+                raise HumanWorkflowError(f"experiment must be running, not {experiment.state!r}")
+            assert uow.session is not None
+            run = uow.session.get(ExecutionRunRecord, str(_human_run_id(experiment_id)))
+            if run is None or run.status != "running":
+                raise HumanWorkflowError("human execution run is not active")
+            started_by = run.device_snapshot.get("operator_id")
+            if started_by != operator_id.strip():
+                raise HumanWorkflowError(
+                    "operator does not match the operator who started execution"
+                )
+            event = uow.session.scalar(
+                select(AuditEventRecord)
+                .where(
+                    AuditEventRecord.experiment_id == str(experiment_id),
+                    AuditEventRecord.event_type == "human.execution_progress",
+                )
+                .order_by(AuditEventRecord.sequence.desc())
+                .limit(1)
+            )
+            started_at = _as_utc(run.started_at)
+            uow.commit()
+        if event is None:
+            return HumanExecutionBackend().start(
+                worklist,
+                operator_id=operator_id,
+                started_at=started_at,
+            )
+        session = HumanExecutionSession.model_validate(event.details, strict=False)
+        if (
+            session.worklist.content_hash != worklist.content_hash
+            or session.operator_id != operator_id.strip()
+            or session.started_at != started_at
+        ):
+            raise HumanWorkflowError("persisted human execution progress is inconsistent")
+        return session
+
+    def persist_execution_session(self, session: HumanExecutionSession) -> None:
+        """Append one acknowledgement checkpoint immediately after operator input."""
+
+        if not session.acknowledgements:
+            raise HumanWorkflowError("execution progress has no acknowledgement to persist")
+        experiment_id = session.worklist.experiment_id
+        with self.storage.unit_of_work() as uow:
+            experiment = uow.experiments.get(str(experiment_id))
+            if experiment.state != ExperimentState.RUNNING.value:
+                raise HumanWorkflowError(f"experiment must be running, not {experiment.state!r}")
+            assert uow.session is not None
+            run = uow.session.get(ExecutionRunRecord, str(_human_run_id(experiment_id)))
+            if run is None or run.status != "running":
+                raise HumanWorkflowError("human execution run is not active")
+            if run.device_snapshot.get("operator_id") != session.operator_id:
+                raise HumanWorkflowError("execution progress operator differs from start record")
+            previous = uow.session.scalar(
+                select(AuditEventRecord)
+                .where(
+                    AuditEventRecord.experiment_id == str(experiment_id),
+                    AuditEventRecord.event_type == "human.execution_progress",
+                )
+                .order_by(AuditEventRecord.sequence.desc())
+                .limit(1)
+            )
+            previous_session = (
+                None
+                if previous is None
+                else HumanExecutionSession.model_validate(previous.details, strict=False)
+            )
+            previous_acknowledgements = (
+                () if previous_session is None else previous_session.acknowledgements
+            )
+            if (
+                len(session.acknowledgements) != len(previous_acknowledgements) + 1
+                or session.acknowledgements[:-1] != previous_acknowledgements
+            ):
+                raise HumanWorkflowError(
+                    "execution progress must append exactly one new acknowledgement"
+                )
+            latest = session.acknowledgements[-1]
+            uow.provenance.append_audit(
+                campaign_id=experiment.campaign_id,
+                experiment_id=experiment.id,
+                entity_type="human_execution_session",
+                entity_id=str(session.session_id),
+                event_type="human.execution_progress",
+                actor=session.operator_id,
+                details=session,
+                occurred_at=latest.acknowledged_at,
+            )
+            uow.commit()
+
     def abort_execution(
         self,
         experiment_id: UUID,
@@ -289,6 +403,15 @@ class HumanWorkflowService:
                 )
             elif experiment.state != ExperimentState.RUNNING.value:
                 raise HumanWorkflowError(f"cannot abort experiment in {experiment.state!r}")
+            else:
+                assert uow.session is not None
+                execution_run = uow.session.get(ExecutionRunRecord, str(run_id))
+                if execution_run is None:
+                    raise HumanWorkflowError("human execution run evidence is missing")
+                if execution_run.device_snapshot.get("operator_id") != operator_id.strip():
+                    raise HumanWorkflowError(
+                        "abort operator does not match the operator who started execution"
+                    )
             uow.records.finish_execution(
                 str(run_id),
                 status="aborted",
@@ -351,16 +474,34 @@ def _validate_record_against_worklist(
     record: HumanExecutionRecord,
     worklist: OperatorWorklist,
 ) -> None:
+    if record.experiment_id != worklist.experiment_id:
+        raise HumanWorkflowError("human record experiment differs from worklist")
     if record.protocol_id != worklist.protocol_id or record.worklist_id != worklist.worklist_id:
         raise HumanWorkflowError("human record is not bound to the persisted worklist")
     if record.execution_mode != worklist.execution_mode:
         raise HumanWorkflowError("human record execution mode differs from worklist")
-    expected = {step.step_id for step in worklist.requested_steps}
-    observed = {step.step_id for step in record.step_evidence}
-    if record.status is ExecutionStatus.COMPLETED and expected != observed:
-        raise HumanWorkflowError("human execution does not cover every protocol step")
-    if record.status is not ExecutionStatus.COMPLETED and not observed.issubset(expected):
-        raise HumanWorkflowError("terminal human evidence contains unknown protocol steps")
+    backend = HumanExecutionBackend()
+    session = backend.start(
+        worklist,
+        operator_id=record.operator_id,
+        started_at=record.started_at,
+    ).model_copy(update={"acknowledgements": record.acknowledgements})
+    if record.status is not ExecutionStatus.COMPLETED:
+        session = session.model_copy(update={"status": record.status})
+    if record.completed_at is None:
+        raise HumanWorkflowError("terminal human record has no completion timestamp")
+    try:
+        canonical = (
+            backend.complete(session, completed_at=record.completed_at)
+            if record.status is ExecutionStatus.COMPLETED
+            else backend.terminal_record(session, completed_at=record.completed_at)
+        )
+    except ValueError as exc:
+        raise HumanWorkflowError(f"invalid human acknowledgement evidence: {exc}") from exc
+    if canonical != record:
+        raise HumanWorkflowError(
+            "human record is not the canonical evidence derived from its acknowledgements"
+        )
 
 
 def _human_run_id(experiment_id: UUID) -> UUID:
@@ -376,3 +517,7 @@ def _file_uri_path(uri: str) -> Path:
 
 def _media_type(artifact_type: str) -> str:
     return "text/markdown" if artifact_type == "markdown" else "text/csv"
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else require_utc(value)

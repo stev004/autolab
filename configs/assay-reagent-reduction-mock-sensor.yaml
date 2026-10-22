@@ -28,7 +28,7 @@ execution:
   mode: human_sensor
   capability_profile: human_assay_v1
   measurement_source: mock_physical_sensor
-  operator_id: steven
+  operator_id: operator-1
   sensor:
     adapter: mock_physical
     sensor_id: mock-optical-001

@@ -10,7 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from autonomous_lab.campaigns.loader import load_campaign, load_validation_policy
-from autonomous_lab.domain.enums import ExecutionMode, ExecutorType
+from autonomous_lab.domain.enums import ExecutionMode, ExecutorType, MeasurementRole
 from autonomous_lab.domain.experiments import ExperimentProposal
 from autonomous_lab.domain.quantities import QuantityValue
 from autonomous_lab.human import (
@@ -26,6 +26,11 @@ from autonomous_lab.human import (
     render_markdown,
     render_measurements_csv,
     render_preparation_csv,
+)
+from autonomous_lab.measurement_ingestion import (
+    ExpectedMeasurement,
+    make_expected_plan,
+    parse_measurement_csv,
 )
 from autonomous_lab.protocols.assay_compiler import AssayProtocolCompiler
 from autonomous_lab.provenance.hashing import sha256_file
@@ -73,7 +78,7 @@ def _worklist():
         campaign_id=UUID("00000000-0000-0000-0000-000000000803"),
         campaign_name=campaign.campaign.name,
         execution_mode=ExecutionMode.HUMAN_MANUAL,
-        operator_id="steven",
+        operator_id="operator-1",
         generated_at=NOW,
     )
 
@@ -121,7 +126,9 @@ def test_worklist_csv_exports_are_canonical_and_hashed(tmp_path: Path) -> None:
     assert preparation.count("\n") == 28
     assert measurements.count("\n") == 28
     assert "reagent_volume,reagent_unit" in preparation
-    assert "sample_id,well,measurement_type,wavelength_nm" in measurements
+    assert measurements.startswith(
+        "sample_id,measurement_type,wavelength_nm,value,unit,timestamp,status,notes\n"
+    )
     assert ",520,,absorbance_unit,,," in measurements
 
     exported = export_worklist(worklist, tmp_path)
@@ -135,6 +142,62 @@ def test_worklist_csv_exports_are_canonical_and_hashed(tmp_path: Path) -> None:
         assert path.is_file()
         assert sha256_file(path) == artifact.sha256
         assert path.stat().st_size == artifact.byte_count
+
+
+def test_generated_measurement_sheet_round_trips_through_strict_importer() -> None:
+    worklist = _worklist()
+    measure_step = next(
+        group.step_ids[0] for group in worklist.procedure if group.group_id == "measure"
+    )
+    role_counts: dict[str, int] = {}
+    role_aliases = {"positive": MeasurementRole.CONTROL}
+    entries = []
+    for row in worklist.measurement_sheet:
+        replicate = role_counts.get(row.role, 0)
+        role_counts[row.role] = replicate + 1
+        entries.append(
+            ExpectedMeasurement(
+                expected_measurement_id=f"{measure_step}:{row.vessel_id}",
+                sample_id=row.vessel_id,
+                vessel_id=row.vessel_id,
+                step_id=measure_step,
+                sample_role=(
+                    role_aliases[row.role]
+                    if row.role in role_aliases
+                    else MeasurementRole(row.role)
+                ),
+                measurement_type=row.measurement_name,
+                unit=row.unit,
+                wavelength=row.wavelength,
+                replicate_index=replicate,
+            )
+        )
+    plan = make_expected_plan(
+        experiment_id=worklist.experiment_id,
+        protocol_id=worklist.protocol_id,
+        protocol_hash=worklist.protocol_hash,
+        entries=tuple(entries),
+        created_at=worklist.generated_at,
+    )
+    lines = render_measurements_csv(worklist).splitlines()
+    completed = [lines[0]]
+    for line in lines[1:]:
+        fields = line.split(",")
+        fields[3] = "0.125"
+        fields[5] = "2026-08-14T12:30:00Z"
+        fields[6] = "available"
+        completed.append(",".join(fields))
+
+    result = parse_measurement_csv(
+        ("\n".join(completed) + "\n").encode(),
+        plan=plan,
+        submitted_by="operator",
+        source_filename="completed-worklist.csv",
+    )
+
+    assert result.accepted
+    assert result.batch is not None
+    assert len(result.batch.measurements) == len(worklist.measurement_sheet)
 
 
 def test_quantity_deviation_requires_compatible_requested_and_actual_values() -> None:
@@ -182,7 +245,7 @@ def test_virtual_operator_creates_human_evidence_without_measurements() -> None:
 def test_human_backend_groups_acknowledgements_and_requires_complete_worklist() -> None:
     worklist = _worklist()
     backend = HumanExecutionBackend()
-    session = backend.start(worklist, operator_id="steven", started_at=NOW)
+    session = backend.start(worklist, operator_id="operator-1", started_at=NOW)
 
     session = backend.acknowledge(
         session,
@@ -211,7 +274,7 @@ def test_human_backend_groups_acknowledgements_and_requires_complete_worklist() 
 def test_human_backend_abort_is_explicit_and_partial() -> None:
     backend = HumanExecutionBackend()
     worklist = _worklist()
-    session = backend.start(worklist, operator_id="steven", started_at=NOW)
+    session = backend.start(worklist, operator_id="operator-1", started_at=NOW)
     session = backend.acknowledge(
         session,
         group_id="dispense-reagent",

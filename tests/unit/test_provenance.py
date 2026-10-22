@@ -40,7 +40,7 @@ def test_runtime_metadata_captures_lock_hash() -> None:
     root = Path(__file__).resolve().parents[2]
     metadata = capture_runtime_metadata(root)
 
-    assert metadata.application_version == "0.1.0"
+    assert metadata.application_version == "0.5.0"
     assert metadata.uv_lock_sha256 == sha256_file(root / "uv.lock")
     assert metadata.captured_at.utcoffset().total_seconds() == 0
 

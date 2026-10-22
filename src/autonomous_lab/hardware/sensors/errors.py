@@ -44,6 +44,11 @@ class SensorCapabilityError(SensorError):
         super().__init__("unsupported_measurement_request", message, retry_safe=False)
 
 
+class SensorAdapterError(SensorError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(code, message, retry_safe=False)
+
+
 class SensorCalibrationError(SensorError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(code, message, retry_safe=False)
