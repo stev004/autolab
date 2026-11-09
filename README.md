@@ -33,6 +33,9 @@ uv run autolab campaign report "$CID" --database data/autolab.sqlite3
 - There are no real hardware drivers yet. The hardware seam is designed
   (see [Physical hardware seam](#physical-hardware-seam)) but not implemented.
 - It has not been validated or certified for real laboratory use or safety.
+- Stage 6 (biological culture) has started: `autonomous_lab.culture` can run one
+  culture experiment against a setpoint-accepting controller, in memory and with
+  contract fakes only. It is not yet a campaign type. See [culture](docs/culture.md).
 - `src/autonomous_lab/agents/` is a placeholder: it defines the typed contract for a
   future research agent, and no agent implementation exists.
 - Requires Python 3.12 or newer.
@@ -188,6 +191,7 @@ private state. See the
 - [Scientific semantics](docs/scientific-semantics.md)
 - [Protocol and validation](docs/protocol-and-validation.md)
 - [Hardware interface](docs/hardware-interface.md)
+- [Biological culture](docs/culture.md)
 - [Provenance](docs/provenance.md)
 - [Roadmap](docs/roadmap.md)
 

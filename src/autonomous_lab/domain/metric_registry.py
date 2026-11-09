@@ -40,6 +40,9 @@ METRIC_REGISTRY: MappingProxyType[str, MetricDefinition] = MappingProxyType(
         "response_standard_uncertainty": MetricDefinition(
             "dimensionless", constraint_operators=_LTE
         ),
+        # Culture metrics (stage 6). Illustrative objectives, not validated biology.
+        "final_od750": MetricDefinition("dimensionless", _MAXIMIZE, _GTE),
+        "energy_kwh": MetricDefinition("kilowatt_hour", _MINIMIZE, _LTE),
     }
 )
 

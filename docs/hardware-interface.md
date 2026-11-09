@@ -66,6 +66,18 @@ exports a factory accepting `sensor_id` and adapter-owned `settings` and returni
 physical_sensor`. This keeps vendor dependencies outside AutoLab and requires no
 changes to campaign execution, QC, analysis, storage, or optimisation.
 
+## Setpoint-accepting culture controllers
+
+Stage 6 adds `CultureEnvironmentController` in `autonomous_lab.culture.controller`,
+the first plug-in that changes the physical world. It publishes a hashable manifest
+(reactors, setpoint/light ranges, maximum hold, over-temperature trip). It returns
+an acknowledgement carrying the values it actually applied, reports attested
+telemetry, and implements `enter_safe_state`, which the runner calls on every exit
+path. Adapters re-check their own limits, never retry an ambiguous command, and
+keep local protection working without AutoLab. Installed adapters are discovered
+through the `autonomous_lab.culture_controllers` entry-point group. See
+[culture](culture.md).
+
 ## Future actuation
 
 `HumanExecutionBackend` currently provides truthful operator evidence. A later

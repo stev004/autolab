@@ -55,6 +55,10 @@ flowchart TD
   plan and preserves revisions, source metadata, and file/batch hashes.
 - `hardware.sensors` is a narrow read-only physical boundary. Sensor adapters return
   raw evidence and do not perform QC, analysis, or scientific interpretation.
+- `culture` (stage 6) holds environmental conditions and samples a time series through
+  a setpoint-accepting controller seam. It has its own protocol, validation and QC,
+  reuses the domain, sensor and state-machine contracts, and imports no
+  simulation, optimisation or campaign code. It is not yet wired into `campaigns`.
 - `qc` decides whether a run is trustworthy. `analysis` computes scientific metrics.
 - `storage` persists the immutable evidence chain and state transitions.
 - `campaigns` owns the closed-loop lifecycle and is the only layer that joins all of
