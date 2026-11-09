@@ -75,8 +75,9 @@ an acknowledgement carrying the values it actually applied, reports attested
 telemetry, and implements `enter_safe_state`, which the runner calls on every exit
 path. Adapters re-check their own limits, never retry an ambiguous command, and
 keep local protection working without AutoLab. Installed adapters are discovered
-through the `autonomous_lab.culture_controllers` entry-point group. See
-[culture](culture.md).
+through the `autonomous_lab.culture_controllers` entry-point group. Factories
+receive `controller_id`, `settings` and `clock`. A controller with an integrated
+OD probe exposes it through `IntegratedCultureSensor`. See [culture](culture.md).
 
 ## Future actuation
 

@@ -308,27 +308,7 @@ class CampaignConfig(DomainModel):
             raise ValueError("maximum reagent and sample volumes exceed configured well capacity")
 
     def _validate_grid_budget(self) -> None:
-        if self.optimization.strategy != "grid":
-            return
-        grid_size = 1
-        for name, parameter in self.parameter_space.parameters.items():
-            if parameter.resolution is None:
-                raise ValueError(f"grid parameter {name!r} requires a resolution")
-            regular_count = int((parameter.maximum - parameter.minimum) // parameter.resolution) + 1
-            reaches_maximum = (
-                parameter.minimum + (regular_count - 1) * parameter.resolution == parameter.maximum
-            )
-            grid_size *= regular_count if reaches_maximum else regular_count + 1
-            if grid_size > self.optimization.maximum_grid_size:
-                raise ValueError(
-                    "grid contains more than maximum_grid_size="
-                    f"{self.optimization.maximum_grid_size} combinations"
-                )
-        if self.campaign.max_experiments > grid_size:
-            raise ValueError(
-                f"campaign budget {self.campaign.max_experiments} exceeds finite grid size "
-                f"{grid_size}"
-            )
+        validate_grid_budget(self.parameter_space, self.optimization, self.campaign.max_experiments)
 
 
 class ValidationPolicyConfig(DomainModel):
@@ -359,3 +339,28 @@ class ValidationPolicyConfig(DomainModel):
         if maximum.value > well_maximum.value:
             raise ValueError("maximum dispense volume cannot exceed maximum well volume")
         return self
+
+
+def validate_grid_budget(
+    parameter_space: ParameterSpace, optimization: OptimizationConfig, max_experiments: int
+) -> None:
+    """Reject a grid strategy whose budget or grid size is unusable."""
+
+    if optimization.strategy != "grid":
+        return
+    grid_size = 1
+    for name, parameter in parameter_space.parameters.items():
+        if parameter.resolution is None:
+            raise ValueError(f"grid parameter {name!r} requires a resolution")
+        regular_count = int((parameter.maximum - parameter.minimum) // parameter.resolution) + 1
+        reaches_maximum = (
+            parameter.minimum + (regular_count - 1) * parameter.resolution == parameter.maximum
+        )
+        grid_size *= regular_count if reaches_maximum else regular_count + 1
+        if grid_size > optimization.maximum_grid_size:
+            raise ValueError(
+                "grid contains more than maximum_grid_size="
+                f"{optimization.maximum_grid_size} combinations"
+            )
+    if max_experiments > grid_size:
+        raise ValueError(f"campaign budget {max_experiments} exceeds finite grid size {grid_size}")

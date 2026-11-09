@@ -16,8 +16,8 @@ Execution order for one experiment::
 Every experiment-state change goes through AutoLab's domain state machine, so
 the audit trail uses the same legal transitions as assay experiments.
 
-Not in this slice: persistence, campaign wiring, pause/resume across process
-restarts, and parallel reactors. See ``docs/culture.md``.
+Persistence and the campaign loop live in ``campaigns/culture_service.py``; this
+runner stays free of storage so it can be tested and reused on its own.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import Field
@@ -43,6 +43,7 @@ from autonomous_lab.culture.controller import (
 )
 from autonomous_lab.culture.evidence import CultureRunEvidence, RunEvent
 from autonomous_lab.culture.models import (
+    CultureControllerCapabilities,
     CultureDesign,
     CulturePolicy,
     CultureProtocol,
@@ -57,7 +58,7 @@ from autonomous_lab.culture.timeseries import (
     TimeSeriesReconciliation,
     reconcile_time_series,
 )
-from autonomous_lab.culture.validation import CultureValidationService
+from autonomous_lab.culture.validation import CultureValidationResult, CultureValidationService
 from autonomous_lab.domain.base import DomainModel
 from autonomous_lab.domain.enums import ExperimentState
 from autonomous_lab.domain.experiments import ExperimentProposal
@@ -96,19 +97,38 @@ class CultureExperimentRecord(DomainModel):
         return canonical_sha256(self)
 
 
+class CultureRunObserver(Protocol):
+    """Optional hooks so a caller can make pre-dispatch facts durable as they happen.
+
+    The campaign service uses these to commit the protocol, validation report and
+    the VALIDATED -> QUEUED -> RUNNING transitions *before* any setpoint is sent,
+    so a crash mid-hold leaves a visible RUNNING experiment rather than nothing.
+    """
+
+    def on_validated(
+        self,
+        result: CultureValidationResult,
+        capabilities: CultureControllerCapabilities,
+    ) -> None: ...
+
+    def on_transition(self, transition: StateTransition) -> None: ...
+
+
 class _Audit:
     """Track experiment state through the shared domain state machine."""
 
-    def __init__(self, experiment_id: UUID) -> None:
+    def __init__(self, experiment_id: UUID, observer: CultureRunObserver | None) -> None:
         self.experiment_id = experiment_id
         self.state = ExperimentState.PROPOSED
         self.transitions: list[StateTransition] = []
+        self.observer = observer
 
     def to(self, target: ExperimentState, reason: str | None = None) -> None:
-        self.transitions.append(
-            transition_experiment(self.experiment_id, self.state, target, reason=reason)
-        )
+        transition = transition_experiment(self.experiment_id, self.state, target, reason=reason)
+        self.transitions.append(transition)
         self.state = target
+        if self.observer is not None:
+            self.observer.on_transition(transition)
 
 
 class CultureExperimentRunner:
@@ -131,9 +151,13 @@ class CultureExperimentRunner:
         self.validator = CultureValidationService(self.compiler)
 
     async def run(
-        self, proposal: ExperimentProposal, design: CultureDesign
+        self,
+        proposal: ExperimentProposal,
+        design: CultureDesign,
+        *,
+        observer: CultureRunObserver | None = None,
     ) -> CultureExperimentRecord:
-        audit = _Audit(proposal.experiment_id)
+        audit = _Audit(proposal.experiment_id, observer)
 
         def record(disposition: Disposition, **fields: object) -> CultureExperimentRecord:
             return CultureExperimentRecord.model_validate(
@@ -161,6 +185,8 @@ class CultureExperimentRunner:
             policy=self.policy,
             capabilities=capabilities,
         )
+        if observer is not None:
+            observer.on_validated(validation, capabilities)
         if validation.executable is None:
             audit.to(ExperimentState.REJECTED, "validation rejected the protocol")
             return record(

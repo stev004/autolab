@@ -1,0 +1,60 @@
+# Culture campaign: tune temperature setpoint and light for a simulated algae
+# photobioreactor, maximising end-point OD750 while minimising energy.
+#
+# Requires an installed controller adapter named "algae-sim-reactor" (provided by
+# the separate algae-sim project) that integrates its own OD750 probe. The growth
+# model behind it is illustrative and unvalidated; results are not predictions.
+schema_version: "1"
+experiment_type: culture
+
+campaign:
+  name: algae_sim_light_temperature
+  seed: 7
+  max_experiments: 20
+
+objective:
+  metrics:
+    - name: final_od750
+      direction: maximize
+      unit: dimensionless
+    - name: energy_kwh
+      direction: minimize
+      unit: kilowatt_hour
+
+parameter_space:
+  temperature_setpoint:
+    kind: continuous
+    unit: degC
+    minimum: 20
+    maximum: 34
+    resolution: 0.1
+  light_intensity:
+    kind: continuous
+    unit: micromole / meter ** 2 / second
+    minimum: 30
+    maximum: 400
+    resolution: 1
+
+culture_design:
+  reactor_id: reactor-1
+  duration: {value: 36, unit: hour}
+  sampling_interval: {value: 6, unit: hour}
+  sample_tolerance: {value: 10, unit: minute}
+  telemetry_interval: {value: 15, unit: minute}
+
+culture_qc:
+  warmup: {value: 3, unit: hour}
+  maximum_mean_temperature_deviation: 1.0
+  minimum_telemetry_coverage: 0.9
+  maximum_missing_reading_fraction: 0.2
+  require_final_reading: true
+
+execution:
+  controller:
+    adapter: algae-sim-reactor
+    controller_id: algae-sim-ctrl-001
+  clock: simulated
+
+optimization:
+  strategy: bayesian
+  startup_experiments: 8

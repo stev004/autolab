@@ -28,6 +28,7 @@ from autonomous_lab.culture.models import CultureControllerCapabilities
 from autonomous_lab.domain.base import DomainModel
 from autonomous_lab.domain.identifiers import new_uuid, require_utc, utc_now
 from autonomous_lab.domain.quantities import QuantityValue
+from autonomous_lab.hardware.sensors.contracts import ReadOnlySensor
 
 CULTURE_CONTROLLER_ENTRY_POINT_GROUP = "autonomous_lab.culture_controllers"
 
@@ -157,11 +158,22 @@ class CultureEnvironmentController(Protocol):
 ControllerFactory = Callable[..., object]
 
 
+@runtime_checkable
+class IntegratedCultureSensor(Protocol):
+    """A controller with a built-in OD probe exposes it as a read-only sensor.
+
+    Many bioreactors integrate the probe, so a campaign may omit a separate
+    sensor adapter. The probe still goes through the read-only sensor contract.
+    """
+
+    def culture_sensor(self) -> ReadOnlySensor: ...
+
+
 class CultureControllerRegistry:
     """Resolve installed controller adapters through the entry-point group.
 
     Mirrors ``SensorAdapterRegistry``: a third-party package exports a factory
-    that accepts ``controller_id`` and adapter-owned ``settings``.
+    that accepts ``controller_id``, adapter-owned ``settings`` and ``clock``.
     """
 
     def __init__(self) -> None:
@@ -191,7 +203,13 @@ class CultureControllerRegistry:
         *,
         controller_id: str,
         settings: Mapping[str, object] | None = None,
+        clock: object | None = None,
     ) -> CultureEnvironmentController:
+        """Build an adapter. ``clock`` is the run's ``CultureClock``.
+
+        Simulated adapters advance their world from it; hardware adapters ignore it.
+        """
+
         self.discover()
         try:
             factory = self._factories[name]
@@ -199,7 +217,9 @@ class CultureControllerRegistry:
             raise ControllerError(
                 "controller_adapter_unavailable", f"controller adapter {name!r} is not installed"
             ) from exc
-        controller: object = factory(controller_id=controller_id, settings=dict(settings or {}))
+        controller: object = factory(
+            controller_id=controller_id, settings=dict(settings or {}), clock=clock
+        )
         if not isinstance(controller, CultureEnvironmentController):
             raise ControllerError(
                 "controller_adapter_invalid",

@@ -1,11 +1,23 @@
-# Biological culture (stage 6, slice A)
+# Biological culture (stage 6)
 
-Status: **contracts and an in-memory runner only.** A single culture experiment
-can be compiled, validated, executed against a setpoint-accepting controller,
-sampled as a time series, quality-checked and analysed. It is not yet persisted
-to SQLite or driven by `CampaignService`; that is slice B. No real bioreactor has
-been driven. The QC thresholds and metrics are illustrative and are not validated
-biology.
+Status: **a culture runs as a full AutoLab campaign.** It goes from optimiser
+proposal through compile, validation, execution against a setpoint-accepting
+controller, time-series sampling, QC and analysis, back to the optimiser. All
+evidence is persisted in the SQLite ledger and can be paused and resumed at
+experiment boundaries (slices A and B). Only scripted contract fakes have driven
+it so far; no real bioreactor has. The QC thresholds and metrics are illustrative
+and are not validated biology.
+
+```bash
+uv run autolab culture create configs/culture-algae-sim.yaml --policy configs/culture-policy.yaml
+uv run autolab culture run <campaign-id>
+uv run autolab campaign status <campaign-id>
+uv run autolab culture report <campaign-id>
+```
+
+`culture run` needs an installed controller adapter (see
+[Commandable device seam](#commandable-device-seam)). The example config expects
+`algae-sim-reactor` from the separate algae-sim project.
 
 ## Why a separate protocol type
 
@@ -47,7 +59,10 @@ flowchart TD
 | `timeseries.py` | Matches readings to plan entries: matched, out of window, missing, or unexpected |
 | `qc.py` | Run-integrity checks (see below) |
 | `analysis.py` | Final OD750 and the energy the device reports using during the hold |
-| `runner.py` | Joins the pieces for one experiment and records every state change through the domain state machine |
+| `runner.py` | Joins the pieces for one experiment and records every state change through the domain state machine. An optional `CultureRunObserver` sees validation and transitions as they happen |
+| `campaigns/culture_config.py` | The `experiment_type: culture` campaign document |
+| `campaigns/culture_service.py` | `CultureCampaignService`: ask → run one culture → persist → tell, plus resume |
+| `campaigns/lifecycle.py` | `CampaignLedger`, the resume rules, trial replay, optimiser outbox, checkpoints and status shared with assay campaigns |
 
 ## Validation rules
 
@@ -87,8 +102,16 @@ physical world, so it has more obligations than `ReadOnlySensor`:
 
 Adapters are installed packages exposing a factory in the
 `autonomous_lab.culture_controllers` entry-point group. The factory receives
-`controller_id` and `settings`. The registry checks the returned object at runtime
-and verifies its identity.
+`controller_id`, `settings` and the run's `clock`: simulated adapters advance their
+world from the clock, and hardware adapters ignore it. The registry checks the
+returned object at runtime and verifies its identity. A controller with a built-in
+OD probe implements `IntegratedCultureSensor.culture_sensor()`, and the campaign
+then omits `execution.sensor`. Otherwise the sensor comes from the existing
+`autonomous_lab.sensor_adapters` group.
+
+`execution.clock: simulated` skips real waiting. The campaign refuses it unless
+the controller's manifest declares `is_simulated`, because with real hardware it
+would sample a culture minutes after it started and record that as 24 hours.
 
 ## Culture QC
 
@@ -106,12 +129,41 @@ and verifies its identity.
 A QC failure is terminal and is not learned as a scientific observation, just as
 on the assay path.
 
+## Culture campaigns and their evidence
+
+| Evidence | Where it is stored |
+| --- | --- |
+| Proposal, protocol, validation report (with the policy and the controller manifest) | `proposals`, `protocols`, `validation_reports` |
+| Setpoint command + acknowledgement, safe-state request + acknowledgement | `execution_runs`, `action_events` |
+| Each OD reading, with sensor, calibration hash and plan entry | `measurements` |
+| Culture QC checks | `qc_runs` |
+| `final_od750`, `energy_kwh` | `derived_metrics`, `experiment_results` |
+| Optimiser observation (outbox) | `optimizer_observations` |
+| The complete run record (telemetry series, reconciliation, every transition) | a content-addressed JSON artifact, registered in `artifacts` with its SHA-256 |
+
+Durability follows the assay path. The proposal, protocol, validation report and
+the VALIDATED → QUEUED → RUNNING transitions are committed **before** any setpoint
+is sent. Everything learned from the run is committed in **one** transaction
+afterwards, together with the optimiser outbox row. A crash during the hold
+therefore leaves a visible RUNNING experiment, and automatic resume refuses until
+an operator reconciles it.
+
+Dispositions:
+
+- **Rejected**: the optimiser is told, and the campaign continues.
+- **QC failed**: the run is excluded from learning, and the campaign continues.
+- **Execution failed** (device refusal, stale receipt, sensor not ready, ambiguous
+  or unconfirmed safe state): the evidence is persisted and the **campaign pauses**.
+  A failed multi-hour culture usually needs a person to look at the reactor before
+  the next one starts.
+
+`autolab campaign run/report` refuse culture campaigns, and `autolab culture ...`
+refuses assay campaigns. `autolab campaign status` works for both.
+
 ## Not yet (later slices)
 
-- **Slice B**: persist culture records in the existing JSON-snapshot tables, add
-  `experiment_type: culture` to campaign config, let `CampaignService` select the
-  culture compiler and runner, and add CLI commands.
-- Pause and resume part-way through a multi-day hold, across process restarts.
+- Operator reconciliation of an interrupted (RUNNING) culture, and pause and
+  resume part-way through a multi-day hold across process restarts.
 - Batch proposals for parallel reactors.
 - Time-series storage beyond per-experiment evidence.
 - Contamination handling, inoculum and biological-replicate semantics, and

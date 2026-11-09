@@ -44,6 +44,8 @@ packages = ["src/autonomous_lab"]
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
 testpaths = ["tests"]
+# Shared, scripted test doubles (not biology models) importable from any test.
+pythonpath = ["tests/support"]
 markers = ["slow: longer-running statistical or optimisation benchmark"]
 
 [tool.coverage.run]

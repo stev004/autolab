@@ -4,8 +4,8 @@ A culture holds environmental conditions (temperature setpoint, light) for a
 duration and samples optical density at intervals. This package provides the
 protocol, deterministic validation and receipts, the setpoint-accepting
 controller seam, time-series reconciliation, culture run-integrity QC, analysis
-and an in-memory runner. It does not yet persist to SQLite or plug into
-``CampaignService``; see ``docs/culture.md``.
+and a single-experiment runner. Campaign orchestration and persistence live in
+``autonomous_lab.campaigns.culture_service``; see ``docs/culture.md``.
 """
 
 from autonomous_lab.culture.analysis import CultureMetrics, analyse_culture
@@ -17,6 +17,7 @@ from autonomous_lab.culture.controller import (
     CultureControllerRegistry,
     CultureEnvironmentController,
     EnvironmentTelemetry,
+    IntegratedCultureSensor,
     SafeStateAcknowledgement,
     SetpointAcknowledgement,
     SetpointCommand,
@@ -34,7 +35,11 @@ from autonomous_lab.culture.models import (
     TimeSeriesMeasurementPlan,
 )
 from autonomous_lab.culture.qc import CultureQCCheck, CultureQCReport, evaluate_culture_qc
-from autonomous_lab.culture.runner import CultureExperimentRecord, CultureExperimentRunner
+from autonomous_lab.culture.runner import (
+    CultureExperimentRecord,
+    CultureExperimentRunner,
+    CultureRunObserver,
+)
 from autonomous_lab.culture.timeseries import (
     SampleReading,
     TimeSeriesReconciliation,
@@ -61,11 +66,13 @@ __all__ = [
     "CultureQCConfig",
     "CultureQCReport",
     "CultureRunEvidence",
+    "CultureRunObserver",
     "CultureValidationResult",
     "CultureValidationService",
     "EnvironmentTelemetry",
     "ExecutableCultureProtocol",
     "HoldConditionsCommand",
+    "IntegratedCultureSensor",
     "RunEvent",
     "SafeStateAcknowledgement",
     "SamplePoint",

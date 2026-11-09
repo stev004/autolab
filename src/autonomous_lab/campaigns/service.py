@@ -8,11 +8,11 @@ performs QC/analysis, and then reports eligible observations back to the strateg
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Protocol, cast
-from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy import select
 
@@ -21,8 +21,19 @@ from autonomous_lab.analysis.domain_adapters import (
     readings_from_domain,
 )
 from autonomous_lab.analysis.metrics import analyze_assay
-from autonomous_lab.analysis.pareto import ParetoPoint, pareto_front
 from autonomous_lab.campaigns.config import CampaignConfig, ValidationPolicyConfig
+from autonomous_lab.campaigns.lifecycle import (
+    CampaignExecutionError,
+    CampaignLedger,
+    CampaignStatus,
+    build_strategy,
+    campaign_status,
+)
+from autonomous_lab.campaigns.lifecycle import result_id as _result_id
+from autonomous_lab.campaigns.lifecycle import transition_campaign_row as _transition_campaign
+from autonomous_lab.campaigns.lifecycle import (
+    transition_experiment_row as _transition_experiment,
+)
 from autonomous_lab.campaigns.loader import LoadedCampaign
 from autonomous_lab.domain.enums import (
     CampaignState,
@@ -40,7 +51,6 @@ from autonomous_lab.domain.measurements import DerivedMetric, Measurement
 from autonomous_lab.domain.optimization import OptimizationObservation, OptimizationState
 from autonomous_lab.domain.qc import QCCheckResult, QCResult
 from autonomous_lab.domain.quantities import QuantityValue
-from autonomous_lab.domain.state_machines import transition_campaign, transition_experiment
 from autonomous_lab.hardware.commands import ExecutionEvidence
 from autonomous_lab.hardware.evidence import EvidenceFinalizer, LinearAssayCostCalculator
 from autonomous_lab.hardware.registry import DeviceRegistry
@@ -57,11 +67,7 @@ from autonomous_lab.measurement_ingestion import ExpectedMeasurement, make_expec
 from autonomous_lab.measurement_ingestion.repository import IncompleteMeasurementPlanError
 from autonomous_lab.optimization import (
     FeedbackDisposition,
-    GridSearchStrategy,
-    OptimizationProblem,
     OptimizationStrategy,
-    OptunaStrategy,
-    RandomSearchStrategy,
     StrategyFeedback,
     TrialRecord,
     build_optimization_observation,
@@ -72,7 +78,6 @@ from autonomous_lab.orchestration import (
     ValidationServiceReceiptVerifier,
 )
 from autonomous_lab.protocols import AssayProtocolCompiler
-from autonomous_lab.provenance import capture_runtime_metadata
 from autonomous_lab.qc import IntegrityQCConfig, evaluate_integrity_qc
 from autonomous_lab.qc.domain_adapters import qc_result_from_integrity_report
 from autonomous_lab.qc.engine import QCCheck
@@ -83,7 +88,6 @@ from autonomous_lab.storage.orm import (
     DerivedMetricRecord,
     ExecutionRunRecord,
     ExperimentRecord,
-    ExperimentResultRecord,
     MeasurementRecord,
     OptimizerObservationRecord,
     OptimizerRunRecord,
@@ -107,25 +111,6 @@ class ExecutionBackend(Protocol):
 BackendFactory = Callable[[CampaignConfig, ExperimentProposal], Awaitable[ExecutionBackend]]
 
 
-class CampaignExecutionError(RuntimeError):
-    """Persisted campaign state cannot safely be resumed automatically."""
-
-
-@dataclass(frozen=True, slots=True)
-class CampaignStatus:
-    campaign_id: UUID
-    name: str
-    state: CampaignState
-    experiment_count: int
-    rejected_count: int
-    execution_failed_count: int
-    aborted_count: int
-    qc_failed_count: int
-    valid_observation_count: int
-    feasible_count: int
-    pareto_frontier: tuple[dict[str, object], ...]
-
-
 class CampaignService:
     """Create, run, pause, resume, and summarize a local autonomous campaign."""
 
@@ -143,6 +128,7 @@ class CampaignService:
         artifact_root: str | Path = Path("data/artifacts"),
     ) -> None:
         self.storage = storage
+        self.ledger = CampaignLedger(storage)
         self.validation_policy = validation_policy
         self.optimizer_root = Path(optimizer_root).expanduser().resolve()
         self.prefer_gp = prefer_gp
@@ -162,45 +148,20 @@ class CampaignService:
         """Persist a validated campaign document and reproducibility metadata."""
 
         config = loaded.config
-        campaign_id = campaign_id or uuid4()
-        optimizer_run_id = _optimizer_run_id(campaign_id)
-        runtime = capture_runtime_metadata()
-        storage_uri = self._optimizer_storage_url(campaign_id, config)
-
-        with self.storage.unit_of_work() as uow:
-            uow.campaigns.add(
-                campaign_id=str(campaign_id),
-                name=config.campaign.name,
-                state=CampaignState.DRAFT,
-                schema_version=config.schema_version,
-                config_source=loaded.raw_text,
-                config=config,
-                config_sha256=loaded.canonical_sha256,
-                config_source_sha256=loaded.source_sha256,
-                objective=config.objective,
-                parameter_space=config.parameter_space,
-                application_version=runtime.application_version,
-                git_commit=runtime.git_commit,
-                git_dirty=runtime.git_dirty,
-                source_tree_diff_sha256=runtime.source_tree_diff_sha256,
-                python_version=runtime.python_version,
-                platform=runtime.platform,
-                uv_lock_sha256=runtime.uv_lock_sha256,
-            )
-            _transition_campaign(uow, campaign_id, CampaignState.DRAFT, CampaignState.READY)
-            strategy_name = config.optimization.strategy
-            uow.optimization.add_run(
-                optimizer_run_id=str(optimizer_run_id),
-                campaign_id=str(campaign_id),
-                strategy_name=strategy_name,
-                strategy_version="1.0.0",
-                seed=config.campaign.seed,
-                config=config.optimization,
-                status="ready",
-                external_storage_uri=storage_uri,
-            )
-            uow.commit()
-        return campaign_id
+        return self.ledger.create_campaign(
+            name=config.campaign.name,
+            schema_version=config.schema_version,
+            raw_text=loaded.raw_text,
+            config=config,
+            config_sha256=loaded.canonical_sha256,
+            source_sha256=loaded.source_sha256,
+            objective=config.objective,
+            parameter_space=config.parameter_space,
+            optimization=config.optimization,
+            seed=config.campaign.seed,
+            optimizer_root=self.optimizer_root,
+            campaign_id=campaign_id,
+        )
 
     async def run(
         self,
@@ -491,59 +452,8 @@ class CampaignService:
 
     def status(self, campaign_id: UUID) -> CampaignStatus:
         with self.storage.unit_of_work() as uow:
-            campaign = uow.campaigns.get(str(campaign_id))
-            config = CampaignConfig.model_validate(campaign.config_json, strict=False)
-            experiments = uow.experiments.list_for_campaign(str(campaign_id))
-            assert uow.session is not None
-            observations = list(
-                uow.session.scalars(
-                    select(OptimizerObservationRecord)
-                    .join(
-                        OptimizerRunRecord,
-                        OptimizerObservationRecord.optimizer_run_id == OptimizerRunRecord.id,
-                    )
-                    .where(OptimizerRunRecord.campaign_id == str(campaign_id))
-                )
-            )
-            uow.commit()
-        state_counts: dict[str, int] = {}
-        for experiment in experiments:
-            state_counts[experiment.state] = state_counts.get(experiment.state, 0) + 1
-        points = tuple(
-            ParetoPoint(
-                identifier=item.experiment_id,
-                objectives=tuple(
-                    float(item.objective_values[name])
-                    for name in (metric.name for metric in config.objective.metrics)
-                ),
-                feasible=item.feasible,
-            )
-            for item in observations
-        )
-        frontier = pareto_front(
-            points,
-            directions=tuple(metric.direction.value for metric in config.objective.metrics),
-        )
-        names = tuple(metric.name for metric in config.objective.metrics)
-        return CampaignStatus(
-            campaign_id=campaign_id,
-            name=campaign.name,
-            state=CampaignState(campaign.state),
-            experiment_count=len(experiments),
-            rejected_count=state_counts.get(ExperimentState.REJECTED.value, 0),
-            execution_failed_count=state_counts.get(ExperimentState.FAILED.value, 0),
-            aborted_count=state_counts.get(ExperimentState.ABORTED.value, 0),
-            qc_failed_count=state_counts.get(ExperimentState.QC_FAILED.value, 0),
-            valid_observation_count=len(observations),
-            feasible_count=sum(item.feasible for item in observations),
-            pareto_frontier=tuple(
-                {
-                    "experiment_id": point.identifier,
-                    "objectives": dict(zip(names, point.objectives, strict=True)),
-                }
-                for point in frontier
-            ),
-        )
+            objective = _assay_config(uow.campaigns.get(str(campaign_id))).objective
+        return campaign_status(self.storage, campaign_id, objective)
 
     def report(self, campaign_id: UUID) -> dict[str, object]:
         """Return a concise simulation report suitable for CLI rendering."""
@@ -551,7 +461,7 @@ class CampaignService:
         status = self.status(campaign_id)
         with self.storage.unit_of_work() as uow:
             campaign = uow.campaigns.get(str(campaign_id))
-            config = CampaignConfig.model_validate(campaign.config_json, strict=False)
+            config = _assay_config(campaign)
             assert uow.session is not None
             metric_rows = uow.session.execute(
                 select(
@@ -1407,24 +1317,7 @@ class CampaignService:
         strategy: OptimizationStrategy,
         experiment_id: UUID,
     ) -> None:
-        """Mark a durably queued observation delivered and checkpoint atomically."""
-
-        with self.storage.unit_of_work() as uow:
-            _transition_experiment(
-                uow,
-                experiment_id,
-                ExperimentState.ANALYSED,
-                ExperimentState.OBSERVED,
-            )
-            state = strategy.checkpoint()
-            uow.optimization.add_checkpoint(
-                optimizer_run_id=optimizer_run_id,
-                ordinal=_next_checkpoint_ordinal(
-                    uow, optimizer_run_id, state.suggestion_count
-                ),
-                state=state,
-            )
-            uow.commit()
+        self.ledger.finalize_observation(optimizer_run_id, strategy, experiment_id)
 
     def _persist_qc_result(self, qc_result: QCResult, result: ExperimentResult) -> None:
         with self.storage.unit_of_work() as uow:
@@ -1545,16 +1438,7 @@ class CampaignService:
             uow.commit()
 
     def _checkpoint(self, optimizer_run_id: str, strategy: OptimizationStrategy) -> None:
-        state = strategy.checkpoint()
-        with self.storage.unit_of_work() as uow:
-            uow.optimization.add_checkpoint(
-                optimizer_run_id=optimizer_run_id,
-                ordinal=_next_checkpoint_ordinal(
-                    uow, optimizer_run_id, state.suggestion_count
-                ),
-                state=state,
-            )
-            uow.commit()
+        self.ledger.checkpoint(optimizer_run_id, strategy)
 
     async def _build_backend(
         self,
@@ -1597,54 +1481,22 @@ class CampaignService:
         optimizer_run: OptimizerRunRecord,
         checkpoint: OptimizationState | None,
     ) -> OptimizationStrategy:
-        problem = OptimizationProblem.from_models(config.parameter_space, config.objective)
-        if config.optimization.strategy == "random":
-            return RandomSearchStrategy(
-                campaign_id=campaign_id,
-                problem=problem,
-                seed=config.campaign.seed,
-                restored_state=checkpoint,
-            )
-        if config.optimization.strategy == "grid":
-            return GridSearchStrategy(
-                campaign_id=campaign_id,
-                problem=problem,
-                seed=config.campaign.seed,
-                restored_state=checkpoint,
-                maximum_grid_size=config.optimization.maximum_grid_size,
-            )
-        return OptunaStrategy(
+        return build_strategy(
             campaign_id=campaign_id,
-            problem=problem,
+            parameter_space=config.parameter_space,
+            objective=config.objective,
+            optimization=config.optimization,
             seed=config.campaign.seed,
-            restored_state=checkpoint,
-            startup_experiments=config.optimization.startup_experiments,
-            storage_url=optimizer_run.external_storage_uri,
+            optimizer_run=optimizer_run,
+            checkpoint=checkpoint,
             prefer_gp=self.prefer_gp,
         )
 
     def _load_campaign(
         self, campaign_id: UUID
     ) -> tuple[CampaignRecord, CampaignConfig, OptimizerRunRecord, OptimizationState | None]:
-        with self.storage.unit_of_work() as uow:
-            campaign = uow.campaigns.get(str(campaign_id))
-            config = CampaignConfig.model_validate(campaign.config_json, strict=False)
-            assert uow.session is not None
-            optimizer_run = uow.session.scalar(
-                select(OptimizerRunRecord).where(OptimizerRunRecord.campaign_id == str(campaign_id))
-            )
-            if optimizer_run is None:
-                raise CampaignExecutionError("campaign has no optimizer run")
-            checkpoint_record = uow.optimization.latest_checkpoint(optimizer_run.id)
-            checkpoint = (
-                None
-                if checkpoint_record is None
-                else OptimizationState.model_validate(
-                    checkpoint_record.state_snapshot, strict=False
-                )
-            )
-            uow.commit()
-            return campaign, config, optimizer_run, checkpoint
+        campaign, optimizer_run, checkpoint = self.ledger.load(campaign_id)
+        return campaign, _assay_config(campaign), optimizer_run, checkpoint
 
     def _trial_records(
         self,
@@ -1652,138 +1504,10 @@ class CampaignService:
         *,
         allow_human_pending: bool = False,
     ) -> tuple[TrialRecord, ...]:
-        terminal = {
-            ExperimentState.REJECTED.value: FeedbackDisposition.REJECTED,
-            ExperimentState.FAILED.value: FeedbackDisposition.EXECUTION_FAILED,
-            ExperimentState.QC_FAILED.value: FeedbackDisposition.QC_FAILED,
-            ExperimentState.ABORTED.value: FeedbackDisposition.EXECUTION_FAILED,
-        }
-        with self.storage.unit_of_work() as uow:
-            assert uow.session is not None
-            rows = uow.session.execute(
-                select(ProposalRecord, ExperimentRecord)
-                .join(ExperimentRecord, ProposalRecord.experiment_id == ExperimentRecord.id)
-                .where(ExperimentRecord.campaign_id == str(campaign_id))
-                .order_by(ExperimentRecord.ordinal)
-            ).all()
-            observations = {
-                row.experiment_id: row
-                for row in uow.session.scalars(
-                    select(OptimizerObservationRecord)
-                    .join(
-                        OptimizerRunRecord,
-                        OptimizerObservationRecord.optimizer_run_id == OptimizerRunRecord.id,
-                    )
-                    .where(OptimizerRunRecord.campaign_id == str(campaign_id))
-                )
-            }
-            uow.commit()
-        records: list[TrialRecord] = []
-        for proposal_row, experiment in rows:
-            proposal = ExperimentProposal.model_validate(proposal_row.snapshot, strict=False)
-            if experiment.state in {
-                ExperimentState.ANALYSED.value,
-                ExperimentState.OBSERVED.value,
-            }:
-                stored = observations.get(experiment.id)
-                if stored is None:
-                    raise CampaignExecutionError(
-                        f"observed experiment {experiment.id} has no optimizer observation"
-                    )
-                observation = OptimizationObservation.model_validate(
-                    stored.observation_snapshot, strict=False
-                )
-                feedback = StrategyFeedback.observed(
-                    observation,
-                    proposal.strategy_trial_id,
-                )
-            elif experiment.state in terminal:
-                feedback = StrategyFeedback.excluded(
-                    proposal.strategy_trial_id,
-                    terminal[experiment.state],
-                    reason=experiment.failure_message or experiment.state,
-                )
-            elif allow_human_pending and experiment.state in {
-                ExperimentState.QUEUED.value,
-                ExperimentState.AWAITING_EXECUTION.value,
-                ExperimentState.RUNNING.value,
-                ExperimentState.AWAITING_MEASUREMENTS.value,
-                ExperimentState.MEASURED.value,
-            }:
-                continue
-            else:
-                raise CampaignExecutionError(
-                    f"experiment {experiment.id} is in non-boundary state {experiment.state!r}"
-                )
-            records.append(TrialRecord(proposal, feedback))
-        return tuple(records)
+        return self.ledger.trial_records(campaign_id, allow_human_pending=allow_human_pending)
 
     def _assert_boundary_resume(self, campaign_id: UUID) -> None:
-        allowed = {
-            ExperimentState.REJECTED.value,
-            ExperimentState.FAILED.value,
-            ExperimentState.QC_FAILED.value,
-            ExperimentState.ANALYSED.value,
-            ExperimentState.OBSERVED.value,
-        }
-        with self.storage.unit_of_work() as uow:
-            experiments = uow.experiments.list_for_campaign(str(campaign_id))
-            assert uow.session is not None
-            analysed_evidence = {
-                experiment_id: (
-                    observation_id,
-                    result_id,
-                    qc_eligible,
-                    optimizer_eligible,
-                )
-                for (
-                    experiment_id,
-                    observation_id,
-                    result_id,
-                    qc_eligible,
-                    optimizer_eligible,
-                ) in uow.session.execute(
-                    select(
-                        ExperimentRecord.id,
-                        OptimizerObservationRecord.id,
-                        ExperimentResultRecord.id,
-                        OptimizerObservationRecord.qc_eligible,
-                        ExperimentResultRecord.optimizer_eligible,
-                    )
-                    .outerjoin(
-                        OptimizerObservationRecord,
-                        OptimizerObservationRecord.experiment_id == ExperimentRecord.id,
-                    )
-                    .outerjoin(
-                        ExperimentResultRecord,
-                        ExperimentResultRecord.experiment_id == ExperimentRecord.id,
-                    )
-                    .where(
-                        ExperimentRecord.campaign_id == str(campaign_id),
-                        ExperimentRecord.state == ExperimentState.ANALYSED.value,
-                    )
-                ).all()
-            }
-            uow.commit()
-        nonterminal = [item.id for item in experiments if item.state not in allowed]
-        incomplete_outbox = [
-            experiment_id
-            for experiment_id, evidence in analysed_evidence.items()
-            if evidence[0] is None
-            or evidence[1] is None
-            or evidence[2] is not True
-            or evidence[3] is not True
-        ]
-        if nonterminal:
-            raise CampaignExecutionError(
-                "automatic resume is safe only at experiment boundaries; "
-                f"nonterminal experiments: {nonterminal}"
-            )
-        if incomplete_outbox:
-            raise CampaignExecutionError(
-                "analysed experiments may resume only with complete durable observation "
-                f"evidence: {incomplete_outbox}"
-            )
+        self.ledger.assert_boundary_resume(campaign_id)
 
     def _finalize_pending_observations(
         self,
@@ -1791,34 +1515,7 @@ class CampaignService:
         optimizer_run_id: str,
         strategy: OptimizationStrategy,
     ) -> None:
-        """Acknowledge outbox rows after optimiser reconciliation on resume."""
-
-        with self.storage.unit_of_work() as uow:
-            pending = [
-                item
-                for item in uow.experiments.list_for_campaign(str(campaign_id))
-                if item.state == ExperimentState.ANALYSED.value
-            ]
-            if not pending:
-                uow.commit()
-                return
-            for experiment in pending:
-                _transition_experiment(
-                    uow,
-                    UUID(experiment.id),
-                    ExperimentState.ANALYSED,
-                    ExperimentState.OBSERVED,
-                    reason="durable optimizer observation reconciled after restart",
-                )
-            state = strategy.checkpoint()
-            uow.optimization.add_checkpoint(
-                optimizer_run_id=optimizer_run_id,
-                ordinal=_next_checkpoint_ordinal(
-                    uow, optimizer_run_id, state.suggestion_count
-                ),
-                state=state,
-            )
-            uow.commit()
+        self.ledger.finalize_pending_observations(campaign_id, optimizer_run_id, strategy)
 
     def _historical_parameter_hashes(
         self, campaign_id: UUID, current_experiment_id: UUID
@@ -1839,9 +1536,7 @@ class CampaignService:
                 )
             )
             campaign = uow.campaigns.get(str(campaign_id))
-            parameter_space = CampaignConfig.model_validate(
-                campaign.config_json, strict=False
-            ).parameter_space
+            parameter_space = _assay_config(campaign).parameter_space
         return tuple(
             parameter_fingerprint(
                 ExperimentProposal.model_validate(snapshot, strict=False).parameter_values,
@@ -1856,15 +1551,7 @@ class CampaignService:
         current: CampaignState,
         optimizer_run_id: str,
     ) -> None:
-        if current not in {CampaignState.READY, CampaignState.PAUSED, CampaignState.RUNNING}:
-            raise CampaignExecutionError(f"campaign cannot run from state {current.value!r}")
-        with self.storage.unit_of_work() as uow:
-            if current is not CampaignState.RUNNING:
-                _transition_campaign(uow, campaign_id, current, CampaignState.RUNNING)
-            optimizer = uow.optimization.get_run(optimizer_run_id)
-            optimizer.status = "running"
-            optimizer.status_reason = None
-            uow.commit()
+        self.ledger.start_or_resume(campaign_id, current, optimizer_run_id)
 
     def _pause(
         self,
@@ -1873,93 +1560,13 @@ class CampaignService:
         *,
         reason: str = "operator experiment-boundary pause",
     ) -> None:
-        with self.storage.unit_of_work() as uow:
-            _transition_campaign(
-                uow,
-                campaign_id,
-                CampaignState.RUNNING,
-                CampaignState.PAUSED,
-                reason=reason,
-            )
-            optimizer = uow.optimization.get_run(optimizer_run_id)
-            optimizer.status = "paused"
-            optimizer.status_reason = reason
-            uow.commit()
+        self.ledger.pause(campaign_id, optimizer_run_id, reason=reason)
 
     def _complete(self, campaign_id: UUID, optimizer_run_id: str) -> None:
-        with self.storage.unit_of_work() as uow:
-            _transition_campaign(
-                uow,
-                campaign_id,
-                CampaignState.RUNNING,
-                CampaignState.COMPLETED,
-                reason="experiment budget exhausted",
-            )
-            uow.optimization.finish_run(optimizer_run_id)
-            uow.commit()
+        self.ledger.complete(campaign_id, optimizer_run_id)
 
     def _experiment_count(self, campaign_id: UUID) -> int:
-        with self.storage.unit_of_work() as uow:
-            return len(uow.experiments.list_for_campaign(str(campaign_id)))
-
-    def _optimizer_storage_url(
-        self,
-        campaign_id: UUID,
-        config: CampaignConfig,
-    ) -> str | None:
-        if config.optimization.strategy != "bayesian":
-            return None
-        self.optimizer_root.mkdir(parents=True, exist_ok=True)
-        return f"sqlite:///{self.optimizer_root / f'{campaign_id}.sqlite3'}"
-
-
-def _transition_campaign(
-    uow: UnitOfWork,
-    campaign_id: UUID,
-    current: CampaignState,
-    target: CampaignState,
-    *,
-    reason: str | None = None,
-) -> None:
-    transition = transition_campaign(campaign_id, current, target, reason=reason)
-    uow.campaigns.transition(
-        str(campaign_id),
-        target,
-        expected_state=current.value,
-        reason=transition.reason,
-        details=transition.metadata,
-        occurred_at=transition.occurred_at,
-    )
-
-
-def _transition_experiment(
-    uow: UnitOfWork,
-    experiment_id: UUID,
-    current: ExperimentState,
-    target: ExperimentState,
-    *,
-    reason: str | None = None,
-    metadata: dict[str, object] | None = None,
-) -> None:
-    transition = transition_experiment(
-        experiment_id,
-        current,
-        target,
-        reason=reason,
-        metadata=metadata,
-    )
-    uow.experiments.transition(
-        str(experiment_id),
-        target,
-        expected_state=current.value,
-        reason=transition.reason,
-        details=transition.metadata,
-        failure_category=(
-            None if metadata is None else str(metadata.get("failure_category") or "") or None
-        ),
-        failure_message=reason if target is ExperimentState.FAILED else None,
-        occurred_at=transition.occurred_at,
-    )
+        return self.ledger.experiment_count(campaign_id)
 
 
 def _qc_check_snapshots(result: QCResult) -> tuple[dict[str, object], ...]:
@@ -2012,14 +1619,6 @@ def _evidence_value(
         raise CampaignExecutionError(
             f"execution evidence {name!r} is not compatible with {unit!r}"
         ) from exc
-
-
-def _optimizer_run_id(campaign_id: UUID) -> UUID:
-    return uuid5(NAMESPACE_URL, f"autolab:{campaign_id}:optimizer")
-
-
-def _result_id(experiment_id: UUID) -> UUID:
-    return uuid5(NAMESPACE_URL, f"autolab:{experiment_id}:result")
 
 
 def _solution_summary(
@@ -2151,17 +1750,6 @@ def _domain_measurement_from_record(record: MeasurementRecord) -> Measurement:
     return Measurement.model_validate(record.raw_payload, strict=False)
 
 
-def _next_checkpoint_ordinal(
-    uow: UnitOfWork,
-    optimizer_run_id: str,
-    preferred: int,
-) -> int:
-    """Append state changes even when ask/tell share a suggestion count."""
-
-    latest = uow.optimization.latest_checkpoint(optimizer_run_id)
-    return preferred if latest is None else max(preferred, latest.ordinal + 1)
-
-
 def _count_measurement_origins(
     rows: list[dict[str, object]],
 ) -> dict[str, int]:
@@ -2186,3 +1774,15 @@ def _count_measurement_origins(
 
 def _no_failures(_ordinal: int, _proposal: ExperimentProposal) -> None:
     return None
+
+
+def _assay_config(campaign: CampaignRecord) -> CampaignConfig:
+    """Parse a stored assay campaign, refusing campaigns of another experiment type."""
+
+    experiment_type = campaign.config_json.get("experiment_type", "assay")
+    if experiment_type != "assay":
+        raise CampaignExecutionError(
+            f"campaign {campaign.id} is a {experiment_type!r} campaign; "
+            "use the matching campaign service (for culture: `autolab culture ...`)"
+        )
+    return CampaignConfig.model_validate(campaign.config_json, strict=False)

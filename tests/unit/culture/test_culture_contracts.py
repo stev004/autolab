@@ -61,11 +61,15 @@ def test_duplicate_and_unplanned_readings_are_flagged_not_counted() -> None:
 def test_registry_creates_adapters_and_checks_what_they_return() -> None:
     registry = CultureControllerRegistry()
     clock = SteppedClock(START)
-    registry.register("scripted", lambda controller_id, settings: ScriptedController(clock=clock))
-    registry.register("not-a-controller", lambda controller_id, settings: object())
-    assert registry.create("scripted", controller_id="ctrl-1").controller_id == "ctrl-1"
+    registry.register(
+        "scripted", lambda controller_id, settings, clock: ScriptedController(clock=clock)
+    )
+    registry.register("not-a-controller", lambda controller_id, settings, clock: object())
+    assert (
+        registry.create("scripted", controller_id="ctrl-1", clock=clock).controller_id == "ctrl-1"
+    )
     with pytest.raises(ControllerError) as identity:
-        registry.create("scripted", controller_id="ctrl-2")
+        registry.create("scripted", controller_id="ctrl-2", clock=clock)
     assert identity.value.code == "controller_identity_mismatch"
     with pytest.raises(ControllerError) as invalid:
         registry.create("not-a-controller", controller_id="ctrl-1")
@@ -74,7 +78,7 @@ def test_registry_creates_adapters_and_checks_what_they_return() -> None:
         registry.create("vendor-x", controller_id="ctrl-1")
     assert missing.value.code == "controller_adapter_unavailable"
     with pytest.raises(ValueError, match="already registered"):
-        registry.register("scripted", lambda controller_id, settings: object())
+        registry.register("scripted", lambda controller_id, settings, clock: object())
 
 
 def test_culture_metrics_are_registered_for_objectives() -> None:

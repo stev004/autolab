@@ -38,9 +38,12 @@ contamination handling and biological replicate semantics.
   receipts, a setpoint-accepting controller seam (`autonomous_lab.culture_controllers`),
   culture run-integrity QC, analysis, and an in-memory runner. See
   [culture](culture.md).
-- **Slice B (next):** persistence, `experiment_type: culture` campaign config,
-  `CampaignService` and CLI wiring, so a culture runs as a full campaign.
-- Later: multi-day pause/resume, batch proposals for parallel reactors,
+- **Slice B (implemented):** `experiment_type: culture` campaign config, a trusted
+  culture policy file, `CultureCampaignService` sharing `CampaignLedger` with
+  assay campaigns, evidence in the SQLite ledger plus a content-addressed run
+  record, and `autolab culture create/run/report`.
+- Next: an algae-sim controller adapter, operator reconciliation of an interrupted
+  culture, mid-hold pause/resume, batch proposals for parallel reactors,
   contamination and replicate semantics.
 
 ## Stage 7 - research-agent layer

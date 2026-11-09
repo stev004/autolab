@@ -11,6 +11,8 @@ import yaml
 from pydantic import BaseModel, ValidationError
 
 from autonomous_lab.campaigns.config import CampaignConfig, ValidationPolicyConfig
+from autonomous_lab.campaigns.culture_config import CultureCampaignConfig
+from autonomous_lab.culture.models import CulturePolicy
 from autonomous_lab.provenance.hashing import canonical_sha256, sha256_text
 
 
@@ -31,6 +33,11 @@ def load_campaign(path: str | Path) -> LoadedCampaign:
     source_path = Path(path).resolve()
     raw_text = _read_text(source_path)
     raw = _safe_mapping(raw_text, source_path)
+    if raw.get("experiment_type", "assay") != "assay":
+        raise ConfigurationLoadError(
+            f"{source_path} is a {raw.get('experiment_type')!r} campaign; "
+            "use `autolab culture ...` for culture campaigns"
+        )
     config = _validate_json_semantics(CampaignConfig, raw, source_path)
     return LoadedCampaign(
         config=config,
@@ -39,6 +46,41 @@ def load_campaign(path: str | Path) -> LoadedCampaign:
         source_sha256=sha256_text(raw_text),
         canonical_sha256=canonical_sha256(config),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedCultureCampaign:
+    config: CultureCampaignConfig
+    source_path: Path
+    raw_text: str
+    source_sha256: str
+    canonical_sha256: str
+
+
+def load_culture_campaign(path: str | Path) -> LoadedCultureCampaign:
+    source_path = Path(path).resolve()
+    raw_text = _read_text(source_path)
+    raw = _safe_mapping(raw_text, source_path)
+    if raw.get("experiment_type") != "culture":
+        raise ConfigurationLoadError(
+            f"{source_path} is not a culture campaign (experiment_type: culture)"
+        )
+    config = _validate_json_semantics(CultureCampaignConfig, raw, source_path)
+    return LoadedCultureCampaign(
+        config=config,
+        source_path=source_path,
+        raw_text=raw_text,
+        source_sha256=sha256_text(raw_text),
+        canonical_sha256=canonical_sha256(config),
+    )
+
+
+def load_culture_policy(path: str | Path) -> CulturePolicy:
+    """Load the trusted culture installation policy (not part of any campaign)."""
+
+    source_path = Path(path).resolve()
+    raw = _safe_mapping(_read_text(source_path), source_path)
+    return _validate_json_semantics(CulturePolicy, raw, source_path)
 
 
 def load_validation_policy(path: str | Path) -> ValidationPolicyConfig:

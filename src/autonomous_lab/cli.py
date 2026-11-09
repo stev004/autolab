@@ -14,10 +14,13 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 import typer
 
 from autonomous_lab.campaigns.config import AssayDesignConfig, CampaignConfig
+from autonomous_lab.campaigns.culture_service import CultureCampaignService
 from autonomous_lab.campaigns.loader import (
     ConfigurationLoadError,
     LoadedCampaign,
     load_campaign,
+    load_culture_campaign,
+    load_culture_policy,
     load_validation_policy,
 )
 from autonomous_lab.campaigns.service import (
@@ -25,6 +28,7 @@ from autonomous_lab.campaigns.service import (
     CampaignService,
     CampaignStatus,
 )
+from autonomous_lab.culture import ControllerError
 from autonomous_lab.domain.enums import ParameterScale
 from autonomous_lab.domain.experiments import ExperimentProposal
 from autonomous_lab.domain.quantities import QuantityValue
@@ -75,7 +79,12 @@ campaign_app = typer.Typer(no_args_is_help=True, help="Create, run and inspect c
 experiment_app = typer.Typer(no_args_is_help=True, help="Inspect experiment evidence.")
 execution_app = typer.Typer(no_args_is_help=True, help="Record human protocol execution.")
 measurements_app = typer.Typer(no_args_is_help=True, help="Ingest external raw measurements.")
+culture_app = typer.Typer(
+    no_args_is_help=True,
+    help="Create, run and report culture campaigns (stage 6). Status: `autolab campaign status`.",
+)
 app.add_typer(campaign_app, name="campaign")
+app.add_typer(culture_app, name="culture")
 app.add_typer(experiment_app, name="experiment")
 experiment_app.add_typer(execution_app, name="execution")
 experiment_app.add_typer(measurements_app, name="measurements")
@@ -361,6 +370,132 @@ def campaign_report(
     except OSError as exc:
         _abort(f"could not write report: {exc}", code=3)
     typer.echo(f"wrote campaign report: {output.resolve()}")
+
+
+CulturePolicyOption = Annotated[
+    Path,
+    typer.Option(
+        "--policy",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        help="Trusted installation culture policy.",
+    ),
+]
+
+
+@culture_app.command("create")
+def create_culture_campaign(
+    config: Annotated[
+        Path,
+        typer.Argument(exists=True, file_okay=True, dir_okay=False, readable=True),
+    ],
+    database: DatabaseOption = "data/autolab.sqlite3",
+    policy: CulturePolicyOption = Path("configs/culture-policy.yaml"),
+    optimizer_root: Annotated[
+        Path,
+        typer.Option(help="Directory for optimiser-native checkpoint stores."),
+    ] = Path("data/optimizer"),
+    id_only: Annotated[
+        bool,
+        typer.Option("--id-only", help="Print only the new campaign UUID."),
+    ] = False,
+) -> None:
+    """Validate and persist a new culture campaign."""
+
+    storage = Storage.open(database)
+    try:
+        loaded = load_culture_campaign(config)
+        service = CultureCampaignService(
+            storage, policy=load_culture_policy(policy), optimizer_root=optimizer_root
+        )
+        campaign_id = service.create(loaded)
+    except (ConfigurationLoadError, CampaignExecutionError, ValueError) as exc:
+        _abort(str(exc), code=2)
+    except Exception as exc:
+        _abort(f"could not create culture campaign: {exc}", code=3)
+    finally:
+        storage.close()
+    if id_only:
+        typer.echo(str(campaign_id))
+    else:
+        typer.echo(f"created culture campaign: {campaign_id}")
+        typer.echo(f"name:                     {loaded.config.campaign.name}")
+        typer.echo("state:                    ready")
+
+
+@culture_app.command("run")
+def run_culture_campaign(
+    campaign_id: Annotated[UUID, typer.Argument(help="Culture campaign UUID to run or resume.")],
+    database: DatabaseOption = "data/autolab.sqlite3",
+    policy: CulturePolicyOption = Path("configs/culture-policy.yaml"),
+    optimizer_root: Annotated[
+        Path,
+        typer.Option(help="Directory for optimiser-native checkpoint stores."),
+    ] = Path("data/optimizer"),
+    artifact_root: Annotated[
+        Path,
+        typer.Option(help="Content-addressed store for complete culture run records."),
+    ] = Path("data/artifacts"),
+    max_experiments: Annotated[
+        int | None,
+        typer.Option("--max-experiments", min=1, help="Optional stop budget for this call."),
+    ] = None,
+    quiet: Annotated[
+        bool,
+        typer.Option("--quiet", help="Suppress per-experiment progress output."),
+    ] = False,
+) -> None:
+    """Run culture experiments through the installed controller and sensor adapters.
+
+    With a real controller and the wall clock, each experiment takes its full
+    configured duration.
+    """
+
+    storage = Storage.open(database)
+    try:
+        service = CultureCampaignService(
+            storage,
+            policy=load_culture_policy(policy),
+            optimizer_root=optimizer_root,
+            artifact_root=artifact_root,
+            progress_callback=None if quiet else _emit_campaign_progress,
+        )
+        status = asyncio.run(service.run(campaign_id, max_new_experiments=max_experiments))
+    except (
+        ConfigurationLoadError,
+        CampaignExecutionError,
+        ControllerError,
+        RecordNotFoundError,
+        ValueError,
+    ) as exc:
+        _abort(str(exc), code=2)
+    except Exception as exc:
+        _abort(f"culture campaign execution failed: {exc}", code=3)
+    finally:
+        storage.close()
+    _emit(_status_payload(status), json_output=False)
+
+
+@culture_app.command("report")
+def culture_campaign_report(
+    campaign_id: Annotated[UUID, typer.Argument(help="Culture campaign UUID to report.")],
+    database: DatabaseOption = "data/autolab.sqlite3",
+    policy: CulturePolicyOption = Path("configs/culture-policy.yaml"),
+) -> None:
+    """Print a JSON summary of a culture campaign and its evidence origins."""
+
+    storage = Storage.open(database)
+    try:
+        report = CultureCampaignService(storage, policy=load_culture_policy(policy)).report(
+            campaign_id
+        )
+    except (ConfigurationLoadError, CampaignExecutionError, RecordNotFoundError, ValueError) as exc:
+        _abort(str(exc), code=2)
+    finally:
+        storage.close()
+    typer.echo(json.dumps(report, indent=2, sort_keys=True, default=str))
 
 
 @experiment_app.command("worklist")
