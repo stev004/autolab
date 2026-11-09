@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -21,6 +23,7 @@ from autonomous_lab.measurement_ingestion import (
     make_expected_plan,
     parse_measurement_csv,
 )
+from autonomous_lab.measurement_ingestion.csv_import import read_measurement_csv
 
 EXPERIMENT_ID = UUID("00000000-0000-0000-0000-000000000101")
 PROTOCOL_ID = UUID("00000000-0000-0000-0000-000000000102")
@@ -215,3 +218,94 @@ def test_manual_and_csv_sources_implement_same_async_boundary() -> None:
     )
     assert csv_batch.source_type.value == "file_import"
     assert csv_batch.source_file_sha256 is not None
+
+
+def test_oversized_bytes_are_rejected_before_hashing_or_decoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import autonomous_lab.measurement_ingestion.csv_import as importer
+
+    monkeypatch.setattr(importer, "MAX_CSV_BYTES", 32)
+    result = parse_measurement_csv(
+        b"\xff" * 33, plan=_plan(), submitted_by="operator", source_filename="large.csv"
+    )
+    assert not result.accepted
+    assert result.source_file_sha256 is None
+    assert [issue.code for issue in result.issues] == ["file_too_large"]
+
+
+def test_file_reader_bounds_the_read_without_trusting_file_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import autonomous_lab.measurement_ingestion.csv_import as importer
+
+    sizes: list[int] = []
+
+    class RecordingStream(io.BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            sizes.append(size)
+            return super().read(size)
+
+    monkeypatch.setattr(importer, "MAX_CSV_BYTES", 32)
+    monkeypatch.setattr(Path, "open", lambda *_args, **_kwargs: RecordingStream(b"x" * 100))
+    with pytest.raises(ValueError, match="file_too_large"):
+        read_measurement_csv("growing.csv")
+    assert sizes == [33]
+
+
+def test_row_limit_stops_before_later_malformed_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import autonomous_lab.measurement_ingestion.csv_import as importer
+
+    monkeypatch.setattr(importer, "MAX_CSV_ROWS", 2)
+    content = (
+        b"sample_id,measurement_type,wavelength_nm,value,unit,timestamp\n"
+        + b"B01,absorbance,520,0.031,AU,2026-08-14T18:42:00Z\n" * 3
+        + b'"unterminated later row'
+    )
+    result = parse_measurement_csv(
+        content, plan=_plan(), submitted_by="operator", source_filename="rows.csv"
+    )
+    assert [issue.code for issue in result.issues] == ["too_many_rows"]
+    assert result.batch is None
+
+
+def test_invalid_row_diagnostics_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    import autonomous_lab.measurement_ingestion.csv_import as importer
+
+    monkeypatch.setattr(importer, "MAX_CSV_ISSUES", 2)
+    content = (
+        b"sample_id,measurement_type,wavelength_nm,value,unit,timestamp\n"
+        + b"unexpected,absorbance,520,1,AU,2026-08-14T18:42:00Z\n" * 10
+    )
+    result = parse_measurement_csv(
+        content, plan=_plan(), submitted_by="operator", source_filename="bad.csv"
+    )
+    assert [issue.code for issue in result.issues] == ["too_many_issues"]
+
+
+@pytest.mark.parametrize("value", ["1e1000000", "1e-100000", "0e1000000", "1" * 129])
+def test_csv_extreme_numbers_return_issues_instead_of_expanding_or_overflowing(value: str) -> None:
+    content = (
+        "sample_id,measurement_type,wavelength_nm,value,unit,timestamp\n"
+        f"B01,absorbance,520,{value},AU,2026-08-14T18:42:00Z\n"
+        "B02,absorbance,520,0.029,AU,2026-08-14T18:42:00Z\n"
+    ).encode()
+    result = parse_measurement_csv(
+        content, plan=_plan(), submitted_by="operator", source_filename="exponents.csv"
+    )
+    assert not result.accepted
+    assert "malformed_value" in {issue.code for issue in result.issues}
+
+
+def test_manual_entry_rejects_extreme_exponents_but_preserves_precision() -> None:
+    builder = ManualBatchBuilder(_plan(), "operator", submitted_at=NOW)
+    with pytest.raises(ValidationError, match="adjusted exponent"):
+        builder.set_value("measure:B01", Decimal("1e-100000"), measured_at=NOW)
+    precise = Decimal("0.03112345678901234567890123456789")
+    builder.set_value("measure:B01", precise, measured_at=NOW)
+    builder.set_value("measure:B02", Decimal("0.029"), measured_at=NOW)
+    batch = builder.finalize().batch
+    assert batch is not None
+    assert batch.measurements[0].value == precise

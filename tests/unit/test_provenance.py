@@ -1,7 +1,8 @@
+import json
 import shutil
 import subprocess
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 from uuid import UUID
 
@@ -26,14 +27,43 @@ def test_canonical_json_normalizes_identifiers_and_utc_time() -> None:
     }
 
     assert canonical_json(value) == (
-        '{"at":"2026-08-14T12:00:00.000000Z",'
-        '"id":"00000000-0000-0000-0000-000000000001"}'
+        '{"at":"2026-08-14T12:00:00.000000Z","id":"00000000-0000-0000-0000-000000000001"}'
     )
 
 
 def test_canonical_json_rejects_naive_timestamp() -> None:
     with pytest.raises(ValueError, match="naive"):
         canonical_json({"at": datetime(2026, 8, 14)})
+
+
+def test_canonical_decimal_preserves_all_digits_in_every_decimal_context() -> None:
+    left = Decimal("0.12345678901234567890123456781")
+    right = Decimal("0.12345678901234567890123456782")
+    hashes: set[str] = set()
+    for precision in (6, 28, 80):
+        with localcontext() as context:
+            context.prec = precision
+            assert canonical_sha256(left) != canonical_sha256(right)
+            hashes.add(canonical_sha256(left))
+            assert canonical_json(left) == f'"{left}"'
+    assert len(hashes) == 1
+
+
+@pytest.mark.parametrize("exponent", [1_000_000, -1_000_000])
+def test_extreme_decimal_hashing_uses_bounded_exact_notation(exponent: int) -> None:
+    value = Decimal(f"1e{exponent}")
+    encoded = canonical_json(value)
+    assert len(encoded) < 30
+    assert Decimal(encoded.strip('"')) == value
+    assert canonical_sha256(value) == canonical_sha256(Decimal(f"10e{exponent - 1}"))
+
+
+@pytest.mark.parametrize(
+    ("value", "canonical"),
+    [("1.000", "1"), ("1200.00", "1200"), ("0.00010", "0.0001"), ("-1.230", "-1.23")],
+)
+def test_ordinary_decimal_hash_spelling_is_unchanged(value: str, canonical: str) -> None:
+    assert canonical_json(Decimal(value)) == json.dumps(canonical)
 
 
 def test_runtime_metadata_captures_lock_hash() -> None:

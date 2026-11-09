@@ -15,6 +15,7 @@ from autonomous_lab.storage import (
     Database,
     ImmutableRecordError,
     StateConflictError,
+    Storage,
     UnitOfWork,
     sqlite_pragmas,
 )
@@ -503,3 +504,29 @@ def test_artifact_store_is_content_addressed_and_rejects_unsafe_suffix(tmp_path:
     assert store.resolve(first).read_bytes() == b"raw evidence"
     with pytest.raises(ValueError, match="Unsafe artifact suffix"):
         store.put_bytes(b"bad", suffix="../../escape")
+
+
+def test_initialize_uses_selected_engine_despite_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    other = tmp_path / "environment.sqlite3"
+    monkeypatch.setenv("AUTOLAB_DATABASE_URL", f"sqlite:///{other}")
+    storage = Storage(Database(tmp_path / "explicit%database.sqlite3"))
+    try:
+        storage.initialize()
+        storage.initialize()
+        assert "measurements" in inspect(storage.database.engine).get_table_names()
+        assert not other.exists()
+    finally:
+        storage.close()
+
+
+def test_initialize_preserves_in_memory_database() -> None:
+    storage = Storage(Database("sqlite://"))
+    try:
+        storage.initialize()
+        assert "campaigns" in inspect(storage.database.engine).get_table_names()
+        with storage.database.engine.connect() as connection:
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+    finally:
+        storage.close()

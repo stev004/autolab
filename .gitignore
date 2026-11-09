@@ -4,6 +4,8 @@
 .pytest_cache/
 .ruff_cache/
 .venv/
+dist/
+build/
 .coverage
 coverage.xml
 __pycache__/

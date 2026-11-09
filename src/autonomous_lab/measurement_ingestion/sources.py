@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import math
+from collections.abc import Awaitable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol, runtime_checkable
@@ -17,7 +19,9 @@ from autonomous_lab.domain.protocols import QuantityRange
 from autonomous_lab.domain.quantities import QuantityValue
 from autonomous_lab.hardware.sensors import (
     CalibrationRecord,
+    CalibrationReference,
     CalibrationStatus,
+    ConnectionStatus,
     MeasurementRequest,
     MockPhysicalSensor,
     MockSensorFixture,
@@ -25,6 +29,7 @@ from autonomous_lab.hardware.sensors import (
     ReadOnlySensor,
     SensorCalibrationError,
     SensorCapabilityError,
+    SensorConnection,
     SensorError,
     SensorNotReadyError,
     SensorReadTimeoutError,
@@ -148,9 +153,23 @@ class ReadOnlySensorSource:
         sensor: ReadOnlySensor,
         *,
         source_metadata: dict[str, object] | None = None,
+        lifecycle_timeout_seconds: float = 30.0,
     ) -> None:
+        if not math.isfinite(lifecycle_timeout_seconds) or lifecycle_timeout_seconds <= 0:
+            raise ValueError("sensor lifecycle timeout must be finite and positive")
         self.sensor = sensor
         self.source_metadata = dict(source_metadata or {})
+        self.lifecycle_timeout_seconds = lifecycle_timeout_seconds
+
+    async def _lifecycle[ResultT](self, operation: str, call: Awaitable[ResultT]) -> ResultT:
+        try:
+            return await asyncio.wait_for(call, timeout=self.lifecycle_timeout_seconds)
+        except TimeoutError as exc:
+            raise SensorError(
+                f"sensor_{operation}_timeout",
+                f"sensor {operation} timed out",
+                retry_safe=True,
+            ) from exc
 
     async def acquire(
         self,
@@ -159,9 +178,22 @@ class ReadOnlySensorSource:
     ) -> RawMeasurementBatch:
         if context.experiment_id != plan.experiment_id:
             raise ValueError("acquisition context does not match measurement plan")
-        connection = await self.sensor.open()
+        connection: SensorConnection | None = None
+        failure: BaseException | None = None
         try:
-            capabilities = await self.sensor.capability_manifest()
+            connection = await self._lifecycle("open", self.sensor.open())
+            if (
+                connection.sensor_id != self.sensor.sensor_id
+                or connection.status is not ConnectionStatus.OPEN
+                or not self.sensor.is_open
+            ):
+                raise SensorError(
+                    "sensor_connection_mismatch",
+                    "sensor did not return an open connection for its configured identity",
+                )
+            capabilities = await self._lifecycle(
+                "capability_manifest", self.sensor.capability_manifest()
+            )
             if capabilities.sensor_id != self.sensor.sensor_id:
                 raise SensorError(
                     "sensor_capability_identity_mismatch",
@@ -178,12 +210,8 @@ class ReadOnlySensorSource:
                             "calibration_missing",
                             f"sensor has no calibration for {measurement_type!r}",
                         )
-                    if calibration.status is not CalibrationStatus.VALID:
-                        raise SensorCalibrationError(
-                            f"calibration_{calibration.status.value}",
-                            f"sensor calibration is {calibration.status.value}",
-                        )
-            self_test = await self.sensor.self_test()
+                    _require_calibration_at(calibration, context.acquired_at)
+            self_test = await self._lifecycle("self_test", self.sensor.self_test())
             if self_test.sensor_id != self.sensor.sensor_id:
                 raise SensorError(
                     "sensor_self_test_identity_mismatch",
@@ -269,6 +297,8 @@ class ReadOnlySensorSource:
                             "calibration_evidence_mismatch",
                             "sensor response calibration differs from its capability snapshot",
                         )
+                    _require_calibration_at(calibration, result.measured_at)
+                    _require_calibration_at(calibration, evidence.acquired_at)
                 if result.unit != expected.unit:
                     raise SensorError(
                         "sensor_response_unit_mismatch",
@@ -314,9 +344,26 @@ class ReadOnlySensorSource:
                         },
                     )
                 )
+        except BaseException as exc:
+            failure = exc
+            raise
         finally:
             if self.sensor.is_open:
-                await self.sensor.close()
+                try:
+                    closed = await self._lifecycle("close", self.sensor.close())
+                    if (
+                        closed.sensor_id != self.sensor.sensor_id
+                        or closed.status is not ConnectionStatus.CLOSED
+                        or self.sensor.is_open
+                        or (connection is not None and closed.session_id != connection.session_id)
+                    ):
+                        raise SensorError(
+                            "sensor_close_mismatch", "sensor did not confirm a consistent close"
+                        )
+                except Exception as cleanup_error:
+                    if failure is None:
+                        raise
+                    failure.add_note(f"Sensor cleanup also failed: {cleanup_error}")
         return make_raw_batch(
             experiment_id=plan.experiment_id,
             plan_id=plan.plan_id,
@@ -325,6 +372,20 @@ class ReadOnlySensorSource:
             submitted_by=context.submitted_by,
             submitted_at=context.acquired_at,
         )
+
+
+def _require_calibration_at(calibration: CalibrationReference, at: datetime) -> None:
+    if calibration.status is not CalibrationStatus.VALID:
+        raise SensorCalibrationError(
+            f"calibration_{calibration.status.value}",
+            f"sensor calibration is {calibration.status.value}",
+        )
+    if at < calibration.calibrated_at:
+        raise SensorCalibrationError(
+            "calibration_not_yet_valid", "reading predates its sensor calibration"
+        )
+    if calibration.expires_at is not None and at >= calibration.expires_at:
+        raise SensorCalibrationError("calibration_expired", "sensor calibration has expired")
 
 
 # Compatibility name retained for existing V0.5 callers. The implementation is

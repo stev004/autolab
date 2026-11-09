@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
@@ -11,6 +11,9 @@ from autonomous_lab.domain.quantities import QuantityValue
 from autonomous_lab.hardware.sensors import (
     SensorAdapterError,
     SensorAdapterRegistry,
+    SensorCalibrationError,
+    SensorError,
+    SensorMalformedResponseError,
     SensorReadTimeoutError,
 )
 from autonomous_lab.measurement_ingestion import (
@@ -126,8 +129,159 @@ def test_mock_source_freezes_full_calibration_and_capability_evidence() -> None:
         )
     )
     metadata = batch.measurements[0].source_metadata
-    assert metadata["calibration_record_sha256"] == metadata["sensor_evidence"][
-        "calibration_sha256"
-    ]
+    assert (
+        metadata["calibration_record_sha256"] == metadata["sensor_evidence"]["calibration_sha256"]
+    )
     assert metadata["calibration_record"]["sensor_id"] == "sensor-1"
     assert metadata["sensor_capability_manifest"]["sensor_id"] == "sensor-1"
+
+
+@pytest.mark.parametrize("during_read", [False, True])
+def test_generic_source_checks_calibration_expiry_at_each_reading(
+    monkeypatch: pytest.MonkeyPatch, during_read: bool
+) -> None:
+    import asyncio
+
+    source = _source()
+    sensor = source.sensor
+    manifest = sensor.capability_manifest
+    read = sensor.read
+
+    async def stale_manifest():
+        capabilities = await manifest()
+        reference = capabilities.calibrations[0].model_copy(
+            update={"expires_at": NOW + timedelta(seconds=1 if during_read else -1)}
+        )
+        return capabilities.model_copy(update={"calibrations": (reference,)})
+
+    async def later_read(request):
+        result = await read(request)
+        later = NOW + timedelta(seconds=2)
+        evidence = result.source_evidence.model_copy(update={"acquired_at": later})
+        return result.model_copy(update={"measured_at": later, "source_evidence": evidence})
+
+    monkeypatch.setattr(sensor, "capability_manifest", stale_manifest)
+    if during_read:
+        monkeypatch.setattr(sensor, "read", later_read)
+    with pytest.raises(SensorCalibrationError) as error:
+        asyncio.run(source.acquire(_plan(), _context()))
+    assert error.value.code == "calibration_expired"
+    assert not sensor.is_open
+
+
+def _context():
+    return acquisition_context(
+        experiment_id=EXPERIMENT_ID,
+        run_id=RUN_ID,
+        submitted_by="operator",
+        acquired_at=NOW,
+    )
+
+
+def test_generic_source_rejects_calibration_from_the_future(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    source = _source()
+    manifest = source.sensor.capability_manifest
+
+    async def future_manifest():
+        capabilities = await manifest()
+        reference = capabilities.calibrations[0].model_copy(
+            update={"calibrated_at": NOW + timedelta(seconds=1)}
+        )
+        return capabilities.model_copy(update={"calibrations": (reference,)})
+
+    monkeypatch.setattr(source.sensor, "capability_manifest", future_manifest)
+    with pytest.raises(SensorCalibrationError) as error:
+        asyncio.run(source.acquire(_plan(), _context()))
+    assert error.value.code == "calibration_not_yet_valid"
+    assert not source.sensor.is_open
+
+
+@pytest.mark.parametrize("wrong_field", ["sensor_id", "status"])
+def test_generic_source_rejects_inconsistent_open_response(
+    monkeypatch: pytest.MonkeyPatch, wrong_field: str
+) -> None:
+    import asyncio
+
+    from autonomous_lab.hardware.sensors import ConnectionStatus
+
+    source = _source()
+    open_sensor = source.sensor.open
+
+    async def inconsistent_open():
+        connection = await open_sensor()
+        updates = {
+            wrong_field: "another-sensor" if wrong_field == "sensor_id" else ConnectionStatus.CLOSED
+        }
+        return connection.model_copy(update=updates)
+
+    monkeypatch.setattr(source.sensor, "open", inconsistent_open)
+    with pytest.raises(SensorError) as error:
+        asyncio.run(source.acquire(_plan(), _context()))
+    assert error.value.code == "sensor_connection_mismatch"
+    assert not source.sensor.is_open
+
+
+@pytest.mark.parametrize("operation", ["open", "capability_manifest", "self_test", "close"])
+def test_every_sensor_lifecycle_call_has_a_deadline(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    import asyncio
+
+    sensor = _source().sensor
+    original_open = sensor.open
+    original_close = sensor.close
+
+    async def never_returns():
+        if operation == "open":
+            await original_open()  # Include partially opened transport cleanup.
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(sensor, operation, never_returns)
+
+    async def exercise():
+        source = ReadOnlySensorSource(sensor, lifecycle_timeout_seconds=0.01)
+        try:
+            with pytest.raises(SensorError) as error:
+                await asyncio.wait_for(source.acquire(_plan(), _context()), timeout=1)
+            assert error.value.code == f"sensor_{operation}_timeout"
+            if operation != "close":
+                assert not sensor.is_open
+        finally:
+            if sensor.is_open:
+                await original_close()
+
+    asyncio.run(exercise())
+
+
+def test_cleanup_timeout_preserves_the_original_sensor_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    sensor = _source().sensor
+    original_close = sensor.close
+
+    async def malformed(_request):
+        raise SensorMalformedResponseError("bad response")
+
+    async def never_closes():
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(sensor, "read", malformed)
+    monkeypatch.setattr(sensor, "close", never_closes)
+
+    async def exercise():
+        try:
+            source = ReadOnlySensorSource(sensor, lifecycle_timeout_seconds=0.01)
+            with pytest.raises(SensorMalformedResponseError) as error:
+                await source.acquire(_plan(), _context())
+            assert any("close timed out" in note for note in error.value.__notes__)
+        finally:
+            if sensor.is_open:
+                await original_close()
+
+    asyncio.run(exercise())

@@ -2,7 +2,9 @@ import json
 from pathlib import Path
 from uuid import UUID
 
+import pytest
 import yaml
+from sqlalchemy import inspect
 from typer.testing import CliRunner
 
 from autonomous_lab.campaigns.loader import load_campaign
@@ -35,6 +37,22 @@ def test_init_creates_database_schema(tmp_path: Path) -> None:
     assert (tmp_path / "processed").is_dir()
     assert (tmp_path / "optimizer").is_dir()
     assert "initialized AutoLab database" in result.stdout
+
+
+def test_explicit_init_database_takes_precedence_over_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = tmp_path / "environment.sqlite3"
+    explicit = tmp_path / "explicit.sqlite3"
+    monkeypatch.setenv("AUTOLAB_DATABASE_URL", f"sqlite:///{environment}")
+    result = runner.invoke(app, ["init", "--database", str(explicit)])
+    assert result.exit_code == 0, result.output
+    storage = Storage.open(str(explicit))
+    try:
+        assert "campaigns" in inspect(storage.database.engine).get_table_names()
+        assert not environment.exists()
+    finally:
+        storage.close()
 
 
 def test_campaign_validate_compiles_midpoint_without_execution() -> None:

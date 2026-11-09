@@ -38,6 +38,9 @@ autolab = "autonomous_lab.cli:app"
 [tool.hatch.build.targets.wheel]
 packages = ["src/autonomous_lab"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"migrations" = "autonomous_lab/_migrations"
+
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
 testpaths = ["tests"]

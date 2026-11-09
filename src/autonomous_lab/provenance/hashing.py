@@ -101,8 +101,22 @@ def _canonical_decimal(value: Decimal) -> str:
         raise ValueError("non-finite decimals cannot be canonically serialized")
     if value == 0:
         return "0"
-    normalized = value.normalize()
-    text = format(normalized, "f")
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    return text
+    # normalize() rounds through the ambient Decimal context. Work from the
+    # exact coefficient instead, retaining the existing spelling for ordinary
+    # values while avoiding exponent-sized allocations for extreme values.
+    sign, digits, exponent = value.as_tuple()
+    assert isinstance(exponent, int)
+    coefficient = "".join(str(digit) for digit in digits).rstrip("0")
+    exponent += len(digits) - len(coefficient)
+    point = len(coefficient) + exponent
+    prefix = "-" if sign else ""
+    if max(len(coefficient), point, -point) > 4_096:
+        mantissa = coefficient[0]
+        if len(coefficient) > 1:
+            mantissa += "." + coefficient[1:]
+        return f"{prefix}{mantissa}e{point - 1}"
+    if point <= 0:
+        return prefix + "0." + "0" * -point + coefficient
+    if point >= len(coefficient):
+        return prefix + coefficient + "0" * (point - len(coefficient))
+    return prefix + coefficient[:point] + "." + coefficient[point:]

@@ -11,7 +11,8 @@ from sqlalchemy import engine_from_config, pool
 from autonomous_lab.storage.orm import Base
 
 config = context.config
-if override_url := os.environ.get("AUTOLAB_DATABASE_URL"):
+supplied_connection = config.attributes.get("connection")
+if supplied_connection is None and (override_url := os.environ.get("AUTOLAB_DATABASE_URL")):
     config.set_main_option("sqlalchemy.url", override_url)
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
@@ -33,6 +34,16 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
+    if supplied_connection is not None:
+        context.configure(
+            connection=supplied_connection,
+            target_metadata=target_metadata,
+            compare_type=True,
+            render_as_batch=supplied_connection.dialect.name == "sqlite",
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+        return
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",

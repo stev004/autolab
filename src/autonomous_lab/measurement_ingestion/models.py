@@ -19,6 +19,7 @@ from autonomous_lab.domain.base import DomainModel
 from autonomous_lab.domain.enums import MeasurementRole, MeasurementSourceType
 from autonomous_lab.domain.identifiers import new_uuid, require_utc, utc_now
 from autonomous_lab.domain.quantities import FiniteDecimal, QuantityValue, validate_unit
+from autonomous_lab.measurement_ingestion.limits import validate_measurement_decimal
 from autonomous_lab.provenance.hashing import canonical_sha256
 
 
@@ -133,6 +134,11 @@ class RawMeasurement(DomainModel):
     unavailable_reason: str | None = Field(default=None, max_length=1000)
     correction_reason: str | None = Field(default=None, max_length=1000)
     source_metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("value")
+    @classmethod
+    def _bounded_value(cls, value: Decimal | None) -> Decimal | None:
+        return None if value is None else validate_measurement_decimal(value)
 
     @field_validator("expected_measurement_id", "sample_id", "measurement_type")
     @classmethod

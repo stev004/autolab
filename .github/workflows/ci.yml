@@ -18,3 +18,9 @@ jobs:
         run: uv run ruff check .
       - name: Type check
         run: uv run pyright
+      - name: Build release wheel
+        run: uv build --wheel
+      - name: Test installed wheel outside the checkout
+        env:
+          AUTOLAB_WHEEL_DIR: dist
+        run: uv run pytest -q tests/integration/test_wheel_install.py

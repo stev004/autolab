@@ -146,6 +146,24 @@ uv run ruff check .
 uv run pyright
 ```
 
+Build and test the installed release package outside the checkout:
+
+```bash
+uv build --wheel
+AUTOLAB_WHEEL_DIR=dist uv run pytest -q tests/integration/test_wheel_install.py
+```
+
+Use a directory containing only the current release wheel for this smoke test.
+The wheel includes its Alembic migrations; initialization uses the selected
+database engine, including when `AUTOLAB_DATABASE_URL` and an explicit
+`--database` are both present. The explicit CLI option takes precedence.
+
+`--database` selects the evidence ledger. Optimiser stores, worklists and artifacts
+default to `data/optimizer`, `data/worklists` and `data/artifacts` under the working
+directory; `--optimizer-root` overrides the optimiser location. Keep the working
+directory consistent across commands and preserve these files alongside the ledger
+when archiving a campaign. A database copy alone does not include external artifacts.
+
 The end-to-end tests use fixed seeds and verify that a resumed campaign preserves
 the evidence chain and that optimisation improves feasible Pareto hypervolume over
 its startup design.

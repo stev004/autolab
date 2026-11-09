@@ -50,6 +50,7 @@ from autonomous_lab.measurement_ingestion import (
     mock_physical_sensor_source_from_rows,
     parse_measurement_csv,
 )
+from autonomous_lab.measurement_ingestion.csv_import import read_measurement_csv
 from autonomous_lab.measurement_ingestion.repository import MeasurementIngestionError
 from autonomous_lab.protocols import AssayProtocolCompiler
 from autonomous_lab.storage import RecordNotFoundError, Storage
@@ -626,7 +627,7 @@ def import_measurements(
         service = MeasurementWorkflowService(storage)
         plan = service.plan(experiment_id)
         result = parse_measurement_csv(
-            source.read_bytes(),
+            read_measurement_csv(source),
             plan=plan,
             submitted_by=submitted_by,
             source_filename=source.name,
@@ -672,7 +673,7 @@ def acquire_sensor_measurements(
             assert sensor_config.fixture_path is not None
             fixture_path = Path(sensor_config.fixture_path).expanduser().resolve()
             fixture_result = parse_measurement_csv(
-                fixture_path.read_bytes(),
+                read_measurement_csv(fixture_path),
                 plan=plan,
                 submitted_by="mock-sensor-fixture-loader",
                 source_filename=fixture_path.name,

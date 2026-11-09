@@ -7,12 +7,20 @@ import hashlib
 import io
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import cast
 
 from pydantic import ValidationError
 
 from autonomous_lab.domain.enums import MeasurementSourceType
 from autonomous_lab.domain.quantities import QuantityValue
+from autonomous_lab.measurement_ingestion.limits import (
+    MAX_CSV_BYTES,
+    MAX_CSV_ISSUES,
+    MAX_CSV_ROWS,
+    MAX_NUMERIC_TEXT_LENGTH,
+    validate_measurement_decimal,
+)
 from autonomous_lab.measurement_ingestion.models import (
     ExpectedMeasurement,
     ExpectedMeasurementPlan,
@@ -36,6 +44,16 @@ _BASE_HEADER = (
 _EXTENDED_HEADER = (*_BASE_HEADER, "status", "notes")
 
 
+def read_measurement_csv(path: str | Path) -> bytes:
+    """Bound the read itself, including files that grow after they are opened."""
+
+    with Path(path).open("rb") as stream:
+        content = stream.read(MAX_CSV_BYTES + 1)
+    if len(content) > MAX_CSV_BYTES:
+        raise ValueError(f"file_too_large: measurement CSV exceeds {MAX_CSV_BYTES} bytes")
+    return content
+
+
 def parse_measurement_csv(
     content: bytes,
     *,
@@ -53,6 +71,12 @@ def parse_measurement_csv(
     the extended form with ``status=unavailable`` and a reason in ``notes``.
     """
 
+    if len(content) > MAX_CSV_BYTES:
+        return _failed(
+            plan,
+            None,
+            ImportIssue(code="file_too_large", message=f"CSV exceeds {MAX_CSV_BYTES} bytes"),
+        )
     source_hash = hashlib.sha256(content).hexdigest()
     issues: list[ImportIssue] = []
     try:
@@ -86,7 +110,17 @@ def parse_measurement_csv(
                     details={"actual": header, "accepted": (_BASE_HEADER, _EXTENDED_HEADER)},
                 ),
             )
-        raw_rows = list(reader)
+        raw_rows: list[dict[str | None, str | list[str] | None]] = []
+        for row in reader:
+            if len(raw_rows) >= MAX_CSV_ROWS:
+                return _failed(
+                    plan,
+                    source_hash,
+                    ImportIssue(
+                        code="too_many_rows", message=f"CSV exceeds {MAX_CSV_ROWS} records"
+                    ),
+                )
+            raw_rows.append(row)
     except csv.Error as exc:
         return _failed(
             plan,
@@ -101,6 +135,12 @@ def parse_measurement_csv(
     parsed: list[RawMeasurement] = []
     seen_expected: set[str] = set()
     for row_number, untyped_row in enumerate(raw_rows, start=2):
+        if len(issues) >= MAX_CSV_ISSUES:
+            return _failed(
+                plan,
+                source_hash,
+                ImportIssue(code="too_many_issues", message="CSV has too many invalid rows"),
+            )
         if None in untyped_row or any(value is None for value in untyped_row.values()):
             issues.append(
                 ImportIssue(
@@ -193,6 +233,12 @@ def parse_measurement_csv(
 
     measurements = tuple(parsed)
     issues.extend(reconcile_measurements(plan, measurements, batch_kind=batch_kind))
+    if len(issues) > MAX_CSV_ISSUES:
+        return _failed(
+            plan,
+            source_hash,
+            ImportIssue(code="too_many_issues", message="CSV has too many invalid rows"),
+        )
     if issues:
         return MeasurementImportResult(
             plan_id=plan.plan_id,
@@ -246,14 +292,12 @@ def _parse_row(
     value_text = row["value"].strip()
     if availability is MeasurementAvailability.AVAILABLE:
         try:
-            value = Decimal(value_text)
-            if not value.is_finite():
-                raise InvalidOperation
+            value = _parse_decimal(value_text)
         except (InvalidOperation, ValueError):
             issues.append(
                 ImportIssue(
                     code="malformed_value",
-                    message=f"value {value_text!r} is not a finite number",
+                    message="value is not a supported finite measurement number",
                     row_number=row_number,
                     field="value",
                     sample_id=expected.sample_id,
@@ -353,8 +397,8 @@ def _parse_wavelength(
     if not value:
         return None, None
     try:
-        wavelength = Decimal(value)
-        if not wavelength.is_finite() or wavelength <= 0:
+        wavelength = _parse_decimal(value)
+        if wavelength <= 0:
             raise InvalidOperation
     except (InvalidOperation, ValueError):
         return None, ImportIssue(
@@ -364,6 +408,12 @@ def _parse_wavelength(
             field="wavelength_nm",
         )
     return QuantityValue(value=wavelength, unit="nanometer"), None
+
+
+def _parse_decimal(value: str) -> Decimal:
+    if len(value) > MAX_NUMERIC_TEXT_LENGTH:
+        raise ValueError("numeric representation is too long")
+    return validate_measurement_decimal(Decimal(value))
 
 
 def _same_wavelength(expected: ExpectedMeasurement, actual: QuantityValue | None) -> bool:
@@ -384,7 +434,7 @@ def _parse_utc_timestamp(value: str) -> datetime:
 
 def _failed(
     plan: ExpectedMeasurementPlan,
-    source_hash: str,
+    source_hash: str | None,
     issue: ImportIssue,
 ) -> MeasurementImportResult:
     return MeasurementImportResult(

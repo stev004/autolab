@@ -108,14 +108,20 @@ class Storage:
         than silently diverging from the migration history.
         """
 
-        project_root = Path(__file__).resolve().parents[3]
-        config = Config(str(project_root / "alembic.ini"))
-        config.set_main_option("script_location", str(project_root / "migrations"))
-        config.set_main_option(
-            "sqlalchemy.url",
-            self.database.engine.url.render_as_string(hide_password=False),
-        )
-        command.upgrade(config, "head")
+        package_root = Path(__file__).resolve().parents[1]
+        migration_root = package_root / "_migrations"
+        if not migration_root.is_dir():
+            # Editable/source installs use the same canonical migration files
+            # that the wheel includes as package resources.
+            migration_root = package_root.parents[1] / "migrations"
+        config = Config()
+        config.set_main_option("script_location", str(migration_root))
+        # Reuse the exact engine selected by the caller. This also makes schema
+        # initialization work for an in-memory SQLite database and avoids URL
+        # interpolation and environment-precedence differences in Alembic.
+        with self.database.engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "head")
 
     def unit_of_work(self) -> UnitOfWork:
         return UnitOfWork(self.database)

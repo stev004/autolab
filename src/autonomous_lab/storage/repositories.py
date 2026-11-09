@@ -333,6 +333,26 @@ class ExperimentRepository:
     def get(self, experiment_id: str) -> ExperimentRecord:
         return _required(self.session, ExperimentRecord, str(experiment_id))
 
+    def get_for_update(self, experiment_id: str) -> ExperimentRecord:
+        """Serialize evidence submission and projection for one experiment.
+
+        Call this before other operations in the unit of work. SQLite needs an
+        immediate write transaction because it has no SELECT FOR UPDATE and its
+        legacy driver does not start a transaction for a plain SELECT.
+        """
+
+        if self.session.get_bind().dialect.name == "sqlite":
+            self.session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            return self.get(experiment_id)
+        record = self.session.scalar(
+            select(ExperimentRecord)
+            .where(ExperimentRecord.id == str(experiment_id))
+            .with_for_update()
+        )
+        if record is None:
+            raise RecordNotFoundError(f"ExperimentRecord {experiment_id!r} does not exist")
+        return record
+
     def list_for_campaign(self, campaign_id: str) -> list[ExperimentRecord]:
         return list(
             self.session.scalars(

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from sqlalchemy import select
+
 from autonomous_lab.domain.enums import ExperimentState, MeasurementSourceType
 from autonomous_lab.domain.state_machines import transition_experiment
 from autonomous_lab.measurement_ingestion.models import (
@@ -13,6 +15,7 @@ from autonomous_lab.measurement_ingestion.models import (
 )
 from autonomous_lab.measurement_ingestion.repository import MeasurementIngestionError
 from autonomous_lab.storage import Storage
+from autonomous_lab.storage.orm import MeasurementRecord
 
 
 class MeasurementWorkflowService:
@@ -32,7 +35,7 @@ class MeasurementWorkflowService:
         """Persist one initial/correction batch and mark a fully reconciled plan measured."""
 
         with self.storage.unit_of_work() as uow:
-            experiment = uow.experiments.get(str(batch.experiment_id))
+            experiment = uow.experiments.get_for_update(str(batch.experiment_id))
             campaign = uow.campaigns.get(experiment.campaign_id)
             execution = campaign.config_json.get("execution", {})
             mode = execution.get("mode", "simulation")
@@ -62,6 +65,18 @@ class MeasurementWorkflowService:
                     "measurements may be submitted only after completed human execution "
                     f"and before QC; experiment is {experiment.state!r}"
                 )
+            assert uow.session is not None
+            if (
+                uow.session.scalar(
+                    select(MeasurementRecord.id)
+                    .where(MeasurementRecord.experiment_id == experiment.id)
+                    .limit(1)
+                )
+                is not None
+            ):
+                raise MeasurementIngestionError(
+                    "measurements are already frozen for analysis; this submission was not accepted"
+                )
             uow.measurement_ingestion.add_batch(batch)
             plan_record = uow.measurement_ingestion.latest_plan(experiment.id)
             plan = ExpectedMeasurementPlan.model_validate(plan_record.plan_snapshot, strict=False)
@@ -71,10 +86,7 @@ class MeasurementWorkflowService:
             }
             required = {row.expected_measurement_id for row in plan.entries if row.required}
             received = set(active)
-            if (
-                not required.issubset(received)
-                and batch.batch_kind is MeasurementBatchKind.INITIAL
-            ):
+            if not required.issubset(received) and batch.batch_kind is MeasurementBatchKind.INITIAL:
                 raise MeasurementIngestionError(
                     "measurement submission did not reconcile every required plan entry"
                 )

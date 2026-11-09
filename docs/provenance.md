@@ -29,5 +29,11 @@ Scientific evidence is append-only. Corrections or reanalysis create new version
 artifacts with explicit lineage. Campaign/experiment lifecycle rows may transition,
 but each transition is also an audit event.
 
+Canonical decimal hashes preserve all significant digits independently of Python's
+active decimal precision. Ordinary values retain their fixed-point spelling;
+extreme exponents use exact scientific notation to avoid exponent-sized strings.
+External measurement revisions retain exact decimal text separately from floating
+point query indexes. Existing evidence is never rewritten to replace an older hash.
+
 Large images and binary instrument exports belong in a content-addressed artifact
 store. SQLite stores their relative URI, media type, byte count, SHA-256 and metadata.

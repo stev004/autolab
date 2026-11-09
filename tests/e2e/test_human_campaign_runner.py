@@ -9,9 +9,11 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 from sqlalchemy import func, select
+from typer.testing import CliRunner
 
 from autonomous_lab.campaigns.loader import load_campaign, load_validation_policy
-from autonomous_lab.campaigns.service import CampaignService
+from autonomous_lab.campaigns.service import CampaignExecutionError, CampaignService
+from autonomous_lab.cli import app
 from autonomous_lab.domain.enums import CampaignState, ExperimentState
 from autonomous_lab.human import (
     AcknowledgementDecision,
@@ -36,6 +38,7 @@ from autonomous_lab.storage.orm import (
     ArtifactRecord,
     ExperimentRecord,
     MeasurementIngestionBatchRecord,
+    MeasurementRecord,
     OptimizerObservationRecord,
 )
 
@@ -408,6 +411,145 @@ def test_unavailable_measurement_waits_for_immutable_correction(tmp_path: Path) 
         assert [item.availability for item in history] == ["unavailable", "available"]
         assert uow.experiments.get(experiment.id).state == "measured"
         uow.commit()
+    storage.close()
+
+
+@pytest.mark.parametrize("legacy_conflict", [False, True])
+def test_interrupted_projection_never_silently_ignores_correction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_conflict: bool
+) -> None:
+    import autonomous_lab.campaigns.service as campaign_module
+
+    storage, service = _service(tmp_path)
+    campaign_id = service.create(_loaded("assay-reagent-reduction-manual.yaml", budget=1))
+    asyncio.run(service.run(campaign_id))
+    experiment = _pending(storage, campaign_id)
+    experiment_id = UUID(experiment.id)
+    _confirm_operator(tmp_path, experiment_id)
+    _submit_manual_fixture(tmp_path, experiment_id)
+    original_qc = campaign_module.evaluate_integrity_qc
+
+    def interrupt(*_args, **_kwargs):
+        raise RuntimeError("interrupted after projection")
+
+    monkeypatch.setattr(campaign_module, "evaluate_integrity_qc", interrupt)
+    with pytest.raises(RuntimeError, match="after projection"):
+        asyncio.run(service.run(campaign_id))
+    monkeypatch.setattr(campaign_module, "evaluate_integrity_qc", original_qc)
+
+    workflow = MeasurementWorkflowService(storage)
+    plan = workflow.plan(experiment_id)
+    correction = ManualBatchBuilder(
+        plan, "fixture-operator", batch_kind=MeasurementBatchKind.CORRECTION
+    )
+    correction.set_value(
+        plan.entries[0].expected_measurement_id,
+        0.032,
+        measured_at=datetime.now(UTC),
+        correction_reason="recovered instrument reading",
+    )
+    batch = correction.finalize().batch
+    assert batch is not None
+    if legacy_conflict:
+        # Represent a correction accepted by a pre-fix installation after a
+        # projection commit; raw history must not be rewritten to hide it.
+        with storage.unit_of_work() as uow:
+            uow.measurement_ingestion.add_batch(batch)
+            uow.commit()
+        with pytest.raises(CampaignExecutionError, match="superseded evidence"):
+            asyncio.run(service.run(campaign_id))
+        assert service.status(campaign_id).valid_observation_count == 0
+    else:
+        with pytest.raises(MeasurementIngestionError, match="frozen for analysis"):
+            workflow.submit(batch)
+        resumed = asyncio.run(service.run(campaign_id))
+        assert resumed.state is CampaignState.COMPLETED
+        assert resumed.valid_observation_count == 1
+        with storage.unit_of_work() as uow:
+            assert len(uow.measurement_ingestion.batches_for_experiment(experiment.id)) == 1
+    storage.close()
+
+
+def test_correction_before_projection_is_used_by_completed_campaign(tmp_path: Path) -> None:
+    storage, service = _service(tmp_path)
+    campaign_id = service.create(_loaded("assay-reagent-reduction-manual.yaml", budget=1))
+    asyncio.run(service.run(campaign_id))
+    experiment = _pending(storage, campaign_id)
+    experiment_id = UUID(experiment.id)
+    _confirm_operator(tmp_path, experiment_id)
+    _submit_manual_fixture(tmp_path, experiment_id)
+    workflow = MeasurementWorkflowService(storage)
+    plan = workflow.plan(experiment_id)
+    correction = ManualBatchBuilder(
+        plan, "fixture-operator", batch_kind=MeasurementBatchKind.CORRECTION
+    )
+    correction.set_value(
+        plan.entries[0].expected_measurement_id,
+        0.032,
+        measured_at=datetime.now(UTC),
+        correction_reason="corrected before analysis",
+    )
+    batch = correction.finalize().batch
+    assert batch is not None
+    workflow.submit(batch)
+    assert asyncio.run(service.run(campaign_id)).valid_observation_count == 1
+    with storage.unit_of_work() as uow:
+        assert uow.session is not None
+        reading = uow.session.scalar(
+            select(MeasurementRecord).where(
+                MeasurementRecord.experiment_id == experiment.id,
+                MeasurementRecord.well_id == plan.entries[0].vessel_id,
+            )
+        )
+        assert reading is not None
+        assert reading.value == 0.032
+        assert reading.provenance["revision_number"] == 2
+    storage.close()
+
+
+@pytest.mark.parametrize("sensor", [False, True])
+def test_cli_bounds_both_csv_import_and_mock_fixture_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sensor: bool
+) -> None:
+    import autonomous_lab.measurement_ingestion.csv_import as importer
+
+    storage, service = _service(tmp_path)
+    loaded = _loaded(
+        "assay-reagent-reduction-mock-sensor.yaml"
+        if sensor
+        else "assay-reagent-reduction-manual.yaml",
+        budget=1,
+    )
+    if not sensor:
+        execution = loaded.config.execution.model_copy(update={"measurement_source": "csv_import"})
+        loaded = replace(loaded, config=loaded.config.model_copy(update={"execution": execution}))
+    campaign_id = service.create(loaded)
+    asyncio.run(service.run(campaign_id))
+    experiment = _pending(storage, campaign_id)
+    _confirm_operator(tmp_path, UUID(experiment.id))
+    source = FIXTURE_PATH if sensor else tmp_path / "oversized.csv"
+    if not sensor:
+        source.write_bytes(b"x" * 200)
+    monkeypatch.setattr(importer, "MAX_CSV_BYTES", 128)
+    original_read = Path.read_bytes
+
+    def reject_unbounded_read(path: Path) -> bytes:
+        if path.resolve() == source.resolve():
+            raise AssertionError("CLI must not read the whole CSV")
+        return original_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_unbounded_read)
+    command = ["experiment", "measurements", "acquire" if sensor else "import", experiment.id]
+    command += (
+        ["--operator-id", "fixture-operator"]
+        if sensor
+        else [str(source), "--submitted-by", "fixture-operator"]
+    )
+    result = CliRunner().invoke(app, [*command, "--database", str(tmp_path / "autolab.sqlite3")])
+    assert result.exit_code == 2, result.output
+    assert "file_too_large" in result.output
+    with storage.unit_of_work() as uow:
+        assert not uow.measurement_ingestion.batches_for_experiment(experiment.id)
     storage.close()
 
 

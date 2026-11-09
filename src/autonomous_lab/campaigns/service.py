@@ -1102,6 +1102,9 @@ class CampaignService:
         experiment_id = UUID(experiment.id)
         run_id = _human_execution_run_id(experiment_id)
         with self.storage.unit_of_work() as uow:
+            locked = uow.experiments.get_for_update(experiment.id)
+            if locked.state != ExperimentState.MEASURED.value:
+                raise CampaignExecutionError("external measurements must be in MEASURED state")
             assert uow.session is not None
             proposal_row = uow.session.scalar(
                 select(ProposalRecord).where(ProposalRecord.experiment_id == experiment.id)
@@ -1117,6 +1120,16 @@ class CampaignService:
                 )
             )
             if existing_rows:
+                active_ids = {
+                    item.id
+                    for item in uow.measurement_ingestion.active_revisions(experiment.id)
+                    if item.availability == "available"
+                }
+                if {item.id for item in existing_rows} != active_ids:
+                    raise CampaignExecutionError(
+                        "frozen measurements differ from active revisions; "
+                        "refusing to analyse superseded evidence"
+                    )
                 measurements = tuple(
                     _domain_measurement_from_record(item) for item in existing_rows
                 )

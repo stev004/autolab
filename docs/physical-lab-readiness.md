@@ -72,6 +72,20 @@ new active revision. Original decimal value, operator, timestamp, notes,
 source-file hash, batch hash, plan hash, and supersession link remain queryable. QC
 and analysis consume only the active complete reconciliation.
 
+The first persisted measurement projection freezes the revisions used for analysis.
+Corrections are accepted before that point, including while unavailable values are
+being recovered. Later submissions are explicitly refused rather than silently
+ignored on resume. Submission and projection share a database write lock. If an
+older installation already contains a correction conflicting with a frozen
+projection, resume stops with an error and leaves the evidence unchanged.
+
+External CSVs are limited to 1 MiB, 4,096 records and 100 reported validation issues.
+Both CLI file paths use bounded reads, and the public bytes parser checks its own
+limit before hashing or decoding. Over-limit files have no source hash because their
+complete contents were not processed. Measurement numbers support up to 128 digits
+and adjusted decimal exponents from -100 to 100; unsupported representations return
+validation errors. These limits also protect manual raw-value submissions.
+
 ## Calibration and sensor evidence
 
 `CalibrationRecord` contains sensor and measurement identity, timestamp/expiry,
@@ -82,6 +96,13 @@ a reading. Capability manifests and raw sensor evidence embed calibration refere
 and hashes. Every accepted sensor row also freezes the point-in-time capability
 manifest, self-test result, source evidence, and (for the shipped mock) complete
 calibration record plus its SHA-256 - not merely mutable foreign keys.
+
+The generic source checks connection identity/status and checks calibration validity
+at acquisition and at each reading's timestamps. Opening, capability discovery,
+self-test and closing each have a configurable 30-second deadline; read requests
+retain their own timeout. Cleanup failure does not replace an earlier acquisition
+error. Adapters must cooperate with asynchronous cancellation and provide their own
+transport timeouts; these deadlines do not isolate or forcibly stop in-process code.
 
 The first real optical adapter needs to implement only:
 
