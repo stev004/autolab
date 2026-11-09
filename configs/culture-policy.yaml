@@ -15,5 +15,6 @@ light_intensity_range:
 maximum_duration: {value: 72, unit: hour}
 minimum_sampling_interval: {value: 30, unit: minute}
 maximum_sample_points: 200
+maximum_replicates: 8
 minimum_trip_margin: {value: 2, unit: delta_degree_Celsius}
 trusted_compilers: ["culture_hold_compiler@1.0.0"]

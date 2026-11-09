@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
 from uuid import UUID
 
 from autonomous_lab.culture.models import (
@@ -11,10 +10,10 @@ from autonomous_lab.culture.models import (
     TEMPERATURE_PARAMETER,
     CultureDesign,
     CultureProtocol,
+    CultureReplicate,
     HoldConditionsCommand,
     SamplePoint,
     TimeSeriesMeasurementPlan,
-    seconds,
 )
 from autonomous_lab.domain.experiments import ExperimentProposal
 from autonomous_lab.domain.quantities import QuantityValue
@@ -45,11 +44,20 @@ class CultureProtocolCompiler:
             raise CultureCompilationError(
                 f"culture proposals need exactly {sorted(CULTURE_PARAMETERS)}; got {sorted(values)}"
             )
-        hold = HoldConditionsCommand(
-            reactor_id=design.reactor_id,
-            temperature_setpoint=values[TEMPERATURE_PARAMETER],
-            light_intensity=values[LIGHT_PARAMETER],
-            duration=design.duration,
+        replicates = tuple(
+            CultureReplicate(
+                replicate_index=index,
+                hold=HoldConditionsCommand(
+                    reactor_id=reactor_id,
+                    temperature_setpoint=values[TEMPERATURE_PARAMETER],
+                    light_intensity=values[LIGHT_PARAMETER],
+                    duration=design.duration,
+                ),
+                measurement_plan=build_sampling_plan(
+                    design, reactor_id=reactor_id, experiment_key=str(proposal.experiment_id)
+                ),
+            )
+            for index, reactor_id in enumerate(design.reactor_ids)
         )
         protocol = CultureProtocol(
             experiment_id=proposal.experiment_id,
@@ -59,29 +67,23 @@ class CultureProtocolCompiler:
             compiler_name=self.name,
             compiler_version=self.version,
             design_hash=canonical_sha256(design),
-            hold=hold,
-            measurement_plan=build_sampling_plan(
-                design, experiment_key=str(proposal.experiment_id)
-            ),
+            replicates=replicates,
+            minimum_passing_replicates=design.required_passing_replicates,
+            telemetry_interval=design.telemetry_interval,
         )
         return protocol.model_copy(update={"protocol_hash": protocol.compute_hash()})
 
 
-def build_sampling_plan(design: CultureDesign, *, experiment_key: str) -> TimeSeriesMeasurementPlan:
-    """One reading every ``sampling_interval``, always including the end point.
+def build_sampling_plan(
+    design: CultureDesign, *, reactor_id: str, experiment_key: str
+) -> TimeSeriesMeasurementPlan:
+    """One plan entry per scheduled reading for one reactor.
 
-    The first reading is at one interval, not at t=0: an inoculation reading is a
-    separate concern (biological replicate and inoculum semantics are later work).
+    The schedule comes from ``CultureDesign.offsets_seconds``: a regular interval
+    that always includes the end point, or explicit offsets. There is no t=0
+    reading; an inoculation reading is a separate concern.
     """
 
-    duration = seconds(design.duration)
-    interval = seconds(design.sampling_interval)
-    offsets: list[Decimal] = []
-    current = interval
-    while current < duration:
-        offsets.append(current)
-        current += interval
-    offsets.append(duration)
     points = tuple(
         SamplePoint(
             expected_measurement_id=f"od-{index:03d}",
@@ -91,12 +93,14 @@ def build_sampling_plan(design: CultureDesign, *, experiment_key: str) -> TimeSe
             unit=design.measurement_unit,
             wavelength=design.wavelength,
         )
-        for index, offset in enumerate(offsets, start=1)
+        for index, offset in enumerate(design.offsets_seconds(), start=1)
     )
     # Deterministic plan ID so a recompiled plan hashes identically.
-    plan_seed = canonical_sha256({"experiment": experiment_key, "design": canonical_sha256(design)})
+    plan_seed = canonical_sha256(
+        {"experiment": experiment_key, "reactor": reactor_id, "design": canonical_sha256(design)}
+    )
     return TimeSeriesMeasurementPlan(
         plan_id=UUID(plan_seed[:32]),
-        sample_id=design.reactor_id,
+        sample_id=reactor_id,
         points=points,
     )

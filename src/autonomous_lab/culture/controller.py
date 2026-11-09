@@ -95,6 +95,10 @@ class EnvironmentTelemetry(DomainModel):
     trip_count: int = Field(default=0, ge=0)
     cumulative_energy: QuantityValue
     faults: tuple[str, ...] = ()
+    #: The setpoint command the device is currently holding, if it tracks one.
+    #: Needed to resume a hold after AutoLab restarts; without it, resume can only
+    #: end the hold safely.
+    active_command_id: UUID | None = None
 
     @field_validator("sampled_at")
     @classmethod

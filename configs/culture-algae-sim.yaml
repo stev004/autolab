@@ -36,7 +36,9 @@ parameter_space:
     resolution: 1
 
 culture_design:
-  reactor_id: reactor-1
+  # Three biological replicates; at least two must pass QC for the run to count.
+  reactor_ids: [reactor-1, reactor-2, reactor-3]
+  minimum_passing_replicates: 2
   duration: {value: 36, unit: hour}
   sampling_interval: {value: 6, unit: hour}
   sample_tolerance: {value: 10, unit: minute}
@@ -48,12 +50,16 @@ culture_qc:
   minimum_telemetry_coverage: 0.9
   maximum_missing_reading_fraction: 0.2
   require_final_reading: true
+  # Illustrative contamination screens (not validated for any organism).
+  maximum_od_drop: 0.05
+  maximum_specific_growth_rate_per_hour: 0.5
 
 execution:
   controller:
     adapter: algae-sim-reactor
     controller_id: algae-sim-ctrl-001
   clock: simulated
+  on_interrupt: safe_state
 
 optimization:
   strategy: bayesian

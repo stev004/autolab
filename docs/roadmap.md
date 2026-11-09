@@ -28,23 +28,31 @@ randomisation and batched acquisition.
 Add fluorescence, electrochemical, imaging and microscopy measurement schemas plus
 modality-specific QC and artifact storage.
 
-## Stage 6 - biological culture (in progress)
+## Stage 6 - biological culture (implemented, simulation and contract tests)
 
 Add long-running bioreactor state, sampling schedules, environmental control,
-contamination handling and biological replicate semantics.
+contamination handling and biological replicate semantics. See [culture](culture.md).
 
-- **Slice A (implemented):** `autonomous_lab.culture` adds a hold-conditions
-  protocol with a time-series OD plan, deterministic validation and hash-bound
-  receipts, a setpoint-accepting controller seam (`autonomous_lab.culture_controllers`),
-  culture run-integrity QC, analysis, and an in-memory runner. See
-  [culture](culture.md).
-- **Slice B (implemented):** `experiment_type: culture` campaign config, a trusted
-  culture policy file, `CultureCampaignService` sharing `CampaignLedger` with
-  assay campaigns, evidence in the SQLite ledger plus a content-addressed run
-  record, and `autolab culture create/run/report`.
-- Next: an algae-sim controller adapter, operator reconciliation of an interrupted
-  culture, mid-hold pause/resume, batch proposals for parallel reactors,
-  contamination and replicate semantics.
+- **Environmental control:** a hold-conditions protocol, deterministic validation
+  with hash-bound receipts, and a setpoint-accepting controller seam
+  (`autonomous_lab.culture_controllers`) with acknowledgements and per-reactor
+  safe state.
+- **Sampling schedules:** regular or explicit time-series OD plans with tolerance
+  windows and reconciliation.
+- **Biological replicates:** the same conditions on several reactors in parallel,
+  QC per replicate, a minimum-passing rule, and a replicate mean with its spread
+  passed to the optimiser as uncertainty.
+- **Contamination handling:** device and sensor indicators, OD-drop and
+  growth-rate plausibility screens, and post-hoc operator flags that reports honour.
+- **Long-running state:** a run journal committed as the culture happens, resume
+  across AutoLab restarts (with the device confirming it kept holding), an optional
+  detach that keeps the device holding, and operator `reconcile`.
+- **Campaigns:** `experiment_type: culture`, `CultureCampaignService` sharing
+  `CampaignLedger` with assay campaigns, and `autolab culture
+  create/run/report/reconcile/flag-contamination`.
+
+Not claimed: unattended physical culture, validated thresholds, or any real
+bioreactor run. Batch proposals across reactors belong to stage 8.
 
 ## Stage 7 - research-agent layer
 

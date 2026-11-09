@@ -33,9 +33,10 @@ uv run autolab campaign report "$CID" --database data/autolab.sqlite3
 - There are no real hardware drivers yet. The hardware seam is designed
   (see [Physical hardware seam](#physical-hardware-seam)) but not implemented.
 - It has not been validated or certified for real laboratory use or safety.
-- Stage 6 (biological culture) has started: `autolab culture create/run/report`
-  runs closed-loop culture campaigns against a setpoint-accepting controller, with
-  the full evidence trail. So far only scripted contract fakes have driven it. See
+- Stage 6 (biological culture) is implemented for simulation: `autolab culture ...`
+  runs closed-loop culture campaigns with biological replicates, time-series
+  sampling, contamination screens, a run journal and resume across restarts. So far
+  only scripted contract fakes have driven it, and thresholds are illustrative. See
   [culture](docs/culture.md).
 - `src/autonomous_lab/agents/` is a placeholder: it defines the typed contract for a
   future research agent, and no agent implementation exists.

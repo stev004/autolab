@@ -47,6 +47,7 @@ START = datetime(2026, 11, 1, 8, tzinfo=UTC)
 TEMP = "degree_Celsius"
 LIGHT = "micromole / meter ** 2 / second"
 REACTOR = "reactor-1"
+REACTORS = ("reactor-1", "reactor-2", "reactor-3")
 
 
 def q(value: str | int, unit: str) -> QuantityValue:
@@ -55,7 +56,7 @@ def q(value: str | int, unit: str) -> QuantityValue:
 
 def design(**overrides: object) -> CultureDesign:
     values: dict[str, object] = {
-        "reactor_id": REACTOR,
+        "reactor_ids": (REACTOR,),
         "duration": q(24, "hour"),
         "sampling_interval": q(6, "hour"),
         "sample_tolerance": q(10, "minute"),
@@ -89,7 +90,7 @@ def capabilities(**overrides: object) -> CultureControllerCapabilities:
         "device_type": "photobioreactor_environment",
         "adapter_name": "scripted-test-controller",
         "adapter_version": "0.0.1",
-        "reactor_ids": frozenset({REACTOR}),
+        "reactor_ids": frozenset(REACTORS),
         "temperature_setpoint_range": QuantityRange(minimum=q(15, TEMP), maximum=q(40, TEMP)),
         "light_intensity_range": QuantityRange(minimum=q(0, LIGHT), maximum=q(600, LIGHT)),
         "maximum_hold_duration": q(96, "hour"),
@@ -136,10 +137,19 @@ class ScriptedController:
     #: Adapter-side hard limit, checked even if upstream validation passed.
     internal_maximum_temperature: Decimal | None = None
     safe_state_failure: ControllerError | None = None
+    #: reactor_id -> extra measured-minus-setpoint error (per-replicate faults).
+    reactor_error: dict[str, Decimal] = field(default_factory=dict)
+    #: reactor_id -> device fault codes reported in every telemetry sample.
+    reactor_faults: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    #: Simulates a device that forgot what it was holding (e.g. after a power cut).
+    forget_commands: bool = False
+    #: Raised by read_telemetry, e.g. to simulate an unreachable controller.
+    telemetry_failure: ControllerError | None = None
     commands: list[SetpointCommand] = field(default_factory=list)
     safe_state_calls: list[str] = field(default_factory=list)
-    _applied: SetpointCommand | None = None
-    _started: datetime | None = None
+    safe_state_reactors: list[str] = field(default_factory=list)
+    applied: dict[str, SetpointCommand] = field(default_factory=dict)
+    started: dict[str, datetime] = field(default_factory=dict)
 
     @property
     def controller_id(self) -> str:
@@ -166,8 +176,8 @@ class ScriptedController:
                 rejection_code="setpoint_out_of_device_range",
                 acknowledged_at=self.clock.now(),
             )
-        self._applied = command
-        self._started = self.clock.now()
+        self.applied[command.reactor_id] = command
+        self.started[command.reactor_id] = self.clock.now()
         return SetpointAcknowledgement(
             command_id=command.command_id,
             controller_id=self.controller_id,
@@ -180,25 +190,32 @@ class ScriptedController:
         )
 
     async def read_telemetry(self, reactor_id: str) -> EnvironmentTelemetry:
-        assert self._applied is not None and self._started is not None
-        elapsed = Decimal(str((self.clock.now() - self._started).total_seconds())) / 3600
+        if self.telemetry_failure is not None:
+            raise self.telemetry_failure
+        applied = self.applied[reactor_id]
+        elapsed = Decimal(str((self.clock.now() - self.started[reactor_id]).total_seconds())) / 3600
         tripped = self.trip_after_hours is not None and elapsed >= self.trip_after_hours
         error = self.temperature_error(elapsed)
-        setpoint = self._applied.temperature_setpoint.to(TEMP).value
+        if error is not None:
+            error += self.reactor_error.get(reactor_id, Decimal(0))
+        setpoint = applied.temperature_setpoint.to(TEMP).value
         return EnvironmentTelemetry(
             controller_id=self.controller_id,
             reactor_id=reactor_id,
             sampled_at=self.clock.now(),
             measured_temperature=None if error is None else q(str(setpoint + error), TEMP),
-            applied_temperature_setpoint=self._applied.temperature_setpoint,
-            applied_light_intensity=self._applied.light_intensity,
+            applied_temperature_setpoint=applied.temperature_setpoint,
+            applied_light_intensity=applied.light_intensity,
             protection_tripped=tripped,
             trip_count=1 if tripped else 0,
             cumulative_energy=q(str(self.power_kw * elapsed), "kilowatt_hour"),
+            faults=self.reactor_faults.get(reactor_id, ()),
+            active_command_id=None if self.forget_commands else applied.command_id,
         )
 
     async def enter_safe_state(self, reactor_id: str, reason: str) -> SafeStateAcknowledgement:
         self.safe_state_calls.append(reason)
+        self.safe_state_reactors.append(reactor_id)
         if self.safe_state_failure is not None:
             raise self.safe_state_failure
         return SafeStateAcknowledgement(
@@ -212,10 +229,10 @@ class ScriptedController:
 
 @dataclass
 class ScriptedODSensor:
-    """Read-only OD750 fake returning ``od(elapsed_hours)`` from a script."""
+    """Read-only OD750 fake returning ``od(elapsed_hours, sample_id)`` from a script."""
 
     clock: SteppedClock
-    od: Callable[[Decimal], Decimal] = lambda h: Decimal("0.1") + Decimal("0.05") * h
+    od: Callable[[Decimal, str], Decimal] = lambda h, _s: Decimal("0.1") + Decimal("0.05") * h
     sensor_id: str = "od-1"
     maximum_od: Decimal = Decimal("4")
     fail_hours: frozenset[int] = frozenset()
@@ -291,7 +308,7 @@ class ScriptedODSensor:
         elapsed = hours_since_start(self.clock)
         if int(elapsed) in self.fail_hours:
             raise SensorConnectionError("scripted dropout")
-        value = min(self.od(elapsed), self.maximum_od)
+        value = min(self.od(elapsed, request.sample_id), self.maximum_od)
         measured_at = self.clock.now() + self.read_delay
         return RawSensorMeasurement(
             request_id=request.request_id,

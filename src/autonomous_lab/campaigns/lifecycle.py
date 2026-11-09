@@ -356,6 +356,8 @@ class CampaignLedger:
         allowed = {
             ExperimentState.REJECTED.value,
             ExperimentState.FAILED.value,
+            # Operator-reconciled (or human-aborted) work is terminal too.
+            ExperimentState.ABORTED.value,
             ExperimentState.QC_FAILED.value,
             ExperimentState.ANALYSED.value,
             ExperimentState.OBSERVED.value,

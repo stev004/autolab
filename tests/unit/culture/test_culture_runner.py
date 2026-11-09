@@ -73,8 +73,11 @@ def test_clean_run_is_analysed_with_a_full_evidence_trail() -> None:
     assert controller.safe_state_calls == ["hold complete"]
     assert record.evidence is not None
     # Telemetry every 30 minutes, inclusive of both ends.
-    assert len(record.evidence.telemetry) == 49
-    assert record.evidence.setpoint_command.protocol_hash == record.protocol.protocol_hash  # type: ignore[union-attr]
+    assert len(record.evidence.replicates[0].telemetry) == 49
+    assert (
+        record.evidence.replicates[0].setpoint_command.protocol_hash
+        == record.protocol.protocol_hash
+    )  # type: ignore[union-attr]
     assert len(record.sha256) == 64
 
 
@@ -117,7 +120,7 @@ def test_device_refusal_fails_the_run_and_still_requests_safe_state() -> None:
     )
     assert record.disposition == "failed"
     assert record.reason == "setpoint_out_of_device_range"
-    assert controller.safe_state_calls == ["setpoint rejected: setpoint_out_of_device_range"]
+    assert controller.safe_state_calls == ["setpoints not applied on every replicate"]
     assert sensor.reads == [] and not sensor.is_open
 
 
@@ -126,7 +129,7 @@ def test_ambiguous_setpoint_failure_is_never_learned_from() -> None:
     record, controller, _ = _run(controller_kwargs={"setpoint_failure": failure})
     assert record.disposition == "failed"
     assert record.reason == "setpoint_timeout"
-    assert controller.safe_state_calls == ["setpoint command failed: setpoint_timeout"]
+    assert controller.safe_state_calls == ["setpoints not applied on every replicate"]
     assert _states(record)[-1] == "failed"
 
 
@@ -135,7 +138,7 @@ def test_protection_trip_stops_the_hold_and_fails_qc() -> None:
     assert record.disposition == "qc_failed"
     assert record.qc_report is not None
     assert {"no_protection_trip", "readings_complete"} <= set(record.qc_report.failed_codes)
-    assert record.evidence is not None and record.evidence.stopped_early
+    assert record.evidence is not None and record.evidence.replicates[0].stopped_early
     assert controller.safe_state_calls == ["device protection tripped"]
     assert len(sensor.reads) == 1  # only the 6 h reading happened before the trip
     assert record.metrics is None
@@ -238,3 +241,82 @@ def test_cancellation_still_requests_safe_state() -> None:
         asyncio.run(runner.run(proposal(), design()))
     assert controller.safe_state_calls == ["execution interrupted"]
     assert not sensor.is_open
+
+
+def test_device_contamination_indicator_fails_qc() -> None:
+    record, _, _ = _run(
+        controller_kwargs={"reactor_faults": {"reactor-1": ("contamination_suspected",)}}
+    )
+    assert record.qc_report is not None
+    assert record.qc_report.failed_codes == ("no_contamination_indicator",)
+
+
+def test_od_drop_between_readings_fails_growth_plausibility() -> None:
+    def crashes(hours: Decimal, _sample: str) -> Decimal:
+        return Decimal("0.8") if hours < 15 else Decimal("0.3")  # culture collapses
+
+    record, _, _ = _run(sensor_kwargs={"od": crashes})
+    assert record.qc_report is not None
+    assert record.qc_report.failed_codes == ("growth_plausible",)
+
+
+def test_implausibly_fast_growth_fails_but_the_check_can_be_disabled() -> None:
+    def explodes(hours: Decimal, _sample: str) -> Decimal:
+        return Decimal("0.01") * (Decimal(2) ** int(hours))  # doubling every hour
+
+    strict, _, _ = _run(sensor_kwargs={"od": explodes, "maximum_od": Decimal("1e9")})
+    assert strict.qc_report is not None
+    assert "growth_plausible" in strict.qc_report.failed_codes
+    lenient = CultureQCConfig(maximum_specific_growth_rate_per_hour=None)
+    relaxed, _, _ = _run(sensor_kwargs={"od": explodes, "maximum_od": Decimal("1e9")}, qc=lenient)
+    assert relaxed.disposition == "analysed", relaxed.reason
+
+
+def _replicated_run(**controller_kwargs: object) -> CultureExperimentRecord:
+    clock = SteppedClock(START)
+    controller = ScriptedController(clock=clock, **controller_kwargs)  # type: ignore[arg-type]
+    sensor = ScriptedODSensor(
+        clock=clock,
+        od=lambda h, sample: (
+            Decimal("0.1")
+            + Decimal({"reactor-1": "0.05", "reactor-2": "0.06", "reactor-3": "0.04"}[sample]) * h
+        ),
+    )
+    runner = CultureExperimentRunner(
+        controller=controller, sensor=sensor, clock=clock, policy=policy()
+    )
+    three = design(
+        reactor_ids=("reactor-1", "reactor-2", "reactor-3"), minimum_passing_replicates=2
+    )
+    return asyncio.run(runner.run(proposal(), three))
+
+
+def test_replicate_mean_and_spread_feed_the_metrics() -> None:
+    record = _replicated_run()
+    assert record.disposition == "analysed", record.reason
+    assert record.metrics is not None
+    finals = sorted(item.final_od750.value for item in record.metrics.replicates)
+    assert finals == [Decimal("1.06"), Decimal("1.30"), Decimal("1.54")]
+    assert record.metrics.final_od750.value == Decimal("1.30")
+    summary = record.metrics.summaries["final_od750"]
+    assert summary.n == 3 and summary.standard_deviation == Decimal("0.24")
+
+
+def test_one_failing_replicate_is_excluded_from_the_mean() -> None:
+    record = _replicated_run(reactor_error={"reactor-2": Decimal(3)})
+    assert record.disposition == "analysed"
+    assert record.qc_report is not None
+    assert record.qc_report.passing_reactors == ("reactor-1", "reactor-3")
+    assert record.metrics is not None
+    assert record.metrics.final_od750.value == Decimal("1.18")  # mean of 1.30 and 1.06
+
+
+def test_safe_state_is_requested_for_every_replicate_reactor() -> None:
+    clock = SteppedClock(START)
+    controller = ScriptedController(clock=clock)
+    runner = CultureExperimentRunner(
+        controller=controller, sensor=ScriptedODSensor(clock=clock), clock=clock, policy=policy()
+    )
+    three = design(reactor_ids=("reactor-1", "reactor-2", "reactor-3"))
+    asyncio.run(runner.run(proposal(), three))
+    assert sorted(controller.safe_state_reactors) == ["reactor-1", "reactor-2", "reactor-3"]

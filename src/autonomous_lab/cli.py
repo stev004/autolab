@@ -498,6 +498,56 @@ def culture_campaign_report(
     typer.echo(json.dumps(report, indent=2, sort_keys=True, default=str))
 
 
+@culture_app.command("reconcile")
+def reconcile_culture(
+    campaign_id: Annotated[UUID, typer.Argument(help="Culture campaign UUID.")],
+    experiment_id: Annotated[UUID, typer.Argument(help="Interrupted culture experiment UUID.")],
+    operator: Annotated[str, typer.Option("--operator", help="Who checked the reactor.")],
+    reason: Annotated[str, typer.Option("--reason", help="What was found and done.")],
+    database: DatabaseOption = "data/autolab.sqlite3",
+    policy: CulturePolicyOption = Path("configs/culture-policy.yaml"),
+) -> None:
+    """Close an interrupted culture that could not be resumed automatically.
+
+    Use only after checking the reactor is safe. The experiment becomes ABORTED,
+    is never learned from, and the campaign can be resumed.
+    """
+
+    storage = Storage.open(database)
+    try:
+        CultureCampaignService(storage, policy=load_culture_policy(policy)).reconcile(
+            campaign_id, experiment_id, operator=operator, reason=reason
+        )
+    except (ConfigurationLoadError, CampaignExecutionError, RecordNotFoundError, ValueError) as exc:
+        _abort(str(exc), code=2)
+    finally:
+        storage.close()
+    typer.echo(f"reconciled culture {experiment_id}: aborted by {operator}")
+
+
+@culture_app.command("flag-contamination")
+def flag_culture_contamination(
+    campaign_id: Annotated[UUID, typer.Argument(help="Culture campaign UUID.")],
+    experiment_id: Annotated[UUID, typer.Argument(help="Culture experiment UUID.")],
+    operator: Annotated[str, typer.Option("--operator", help="Who found the contamination.")],
+    reason: Annotated[str, typer.Option("--reason", help="Evidence, e.g. microscopy result.")],
+    database: DatabaseOption = "data/autolab.sqlite3",
+    policy: CulturePolicyOption = Path("configs/culture-policy.yaml"),
+) -> None:
+    """Record contamination found after a run; reports then exclude that run."""
+
+    storage = Storage.open(database)
+    try:
+        CultureCampaignService(storage, policy=load_culture_policy(policy)).flag_contamination(
+            campaign_id, experiment_id, operator=operator, reason=reason
+        )
+    except (ConfigurationLoadError, CampaignExecutionError, RecordNotFoundError, ValueError) as exc:
+        _abort(str(exc), code=2)
+    finally:
+        storage.close()
+    typer.echo(f"flagged culture {experiment_id} as contaminated")
+
+
 @experiment_app.command("worklist")
 def experiment_worklist(
     experiment_id: Annotated[UUID, typer.Argument(help="Human experiment UUID.")],

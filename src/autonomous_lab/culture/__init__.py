@@ -22,23 +22,35 @@ from autonomous_lab.culture.controller import (
     SetpointAcknowledgement,
     SetpointCommand,
 )
-from autonomous_lab.culture.evidence import CultureRunEvidence, RunEvent
+from autonomous_lab.culture.evidence import CultureRunEvidence, ReplicateEvidence, RunEvent
 from autonomous_lab.culture.models import (
     CultureControllerCapabilities,
     CultureDesign,
     CulturePolicy,
     CultureProtocol,
     CultureQCConfig,
+    CultureReplicate,
     ExecutableCultureProtocol,
     HoldConditionsCommand,
     SamplePoint,
     TimeSeriesMeasurementPlan,
 )
-from autonomous_lab.culture.qc import CultureQCCheck, CultureQCReport, evaluate_culture_qc
+from autonomous_lab.culture.qc import (
+    CultureExperimentQC,
+    CultureQCCheck,
+    CultureQCReport,
+    evaluate_culture_qc,
+)
 from autonomous_lab.culture.runner import (
     CultureExperimentRecord,
     CultureExperimentRunner,
+    CultureResumeError,
+    CultureRunJournal,
     CultureRunObserver,
+    DispatchHeader,
+    HoldStarted,
+    InterruptedRun,
+    JournalKind,
 )
 from autonomous_lab.culture.timeseries import (
     SampleReading,
@@ -56,6 +68,7 @@ __all__ = [
     "CultureControllerRegistry",
     "CultureDesign",
     "CultureEnvironmentController",
+    "CultureExperimentQC",
     "CultureExperimentRecord",
     "CultureExperimentRunner",
     "CultureMetrics",
@@ -65,14 +78,22 @@ __all__ = [
     "CultureQCCheck",
     "CultureQCConfig",
     "CultureQCReport",
+    "CultureReplicate",
+    "CultureResumeError",
     "CultureRunEvidence",
+    "CultureRunJournal",
     "CultureRunObserver",
     "CultureValidationResult",
     "CultureValidationService",
+    "DispatchHeader",
     "EnvironmentTelemetry",
     "ExecutableCultureProtocol",
     "HoldConditionsCommand",
+    "HoldStarted",
     "IntegratedCultureSensor",
+    "InterruptedRun",
+    "JournalKind",
+    "ReplicateEvidence",
     "RunEvent",
     "SafeStateAcknowledgement",
     "SamplePoint",

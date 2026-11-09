@@ -10,24 +10,27 @@ Thresholds come from ``CultureQCConfig`` and are illustrative defaults.
 
 from __future__ import annotations
 
+import itertools
+import math
 from decimal import Decimal
 from typing import Any
 
 from pydantic import Field
 
 from autonomous_lab.culture.controller import EnvironmentTelemetry
-from autonomous_lab.culture.evidence import CultureRunEvidence
+from autonomous_lab.culture.evidence import CultureRunEvidence, ReplicateEvidence
 from autonomous_lab.culture.models import (
     LIGHT_UNIT,
     TEMPERATURE_UNIT,
     CultureQCConfig,
+    seconds,
     to_timedelta,
 )
 from autonomous_lab.culture.timeseries import TimeSeriesReconciliation
 from autonomous_lab.domain.base import DomainModel
 from autonomous_lab.hardware.sensors.calibration import CalibrationStatus
 
-QC_VERSION = "culture_integrity_qc@1"
+QC_VERSION = "culture_integrity_qc@2"
 
 
 class CultureQCCheck(DomainModel):
@@ -38,7 +41,10 @@ class CultureQCCheck(DomainModel):
 
 
 class CultureQCReport(DomainModel):
+    """QC for one biological replicate (one reactor)."""
+
     qc_version: str = QC_VERSION
+    reactor_id: str
     passed: bool
     checks: tuple[CultureQCCheck, ...]
 
@@ -47,22 +53,71 @@ class CultureQCReport(DomainModel):
         return tuple(check.code for check in self.checks if not check.passed)
 
 
+class CultureExperimentQC(DomainModel):
+    """Experiment-level verdict: enough replicates passed to learn from their mean."""
+
+    qc_version: str = QC_VERSION
+    passed: bool
+    minimum_passing_replicates: int
+    passing_reactors: tuple[str, ...]
+    replicates: tuple[CultureQCReport, ...]
+
+    @property
+    def failed_codes(self) -> tuple[str, ...]:
+        """Distinct failing check codes across replicates, in first-seen order."""
+
+        codes: list[str] = []
+        for replicate in self.replicates:
+            codes += [code for code in replicate.failed_codes if code not in codes]
+        if not self.passed and not codes:
+            codes.append("too_few_passing_replicates")
+        return tuple(codes)
+
+
 def evaluate_culture_qc(
     evidence: CultureRunEvidence,
+    reconciliations: dict[str, TimeSeriesReconciliation],
+    config: CultureQCConfig,
+    *,
+    minimum_passing_replicates: int,
+) -> CultureExperimentQC:
+    reports = tuple(
+        evaluate_replicate_qc(evidence, replicate, reconciliations[replicate.reactor_id], config)
+        for replicate in evidence.replicates
+    )
+    passing = tuple(report.reactor_id for report in reports if report.passed)
+    return CultureExperimentQC(
+        passed=len(passing) >= minimum_passing_replicates,
+        minimum_passing_replicates=minimum_passing_replicates,
+        passing_reactors=passing,
+        replicates=reports,
+    )
+
+
+def evaluate_replicate_qc(
+    run: CultureRunEvidence,
+    replicate: ReplicateEvidence,
     reconciliation: TimeSeriesReconciliation,
     config: CultureQCConfig,
 ) -> CultureQCReport:
     checks = (
-        _setpoint_acknowledged(evidence),
-        _no_protection_trip(evidence),
-        _telemetry_coverage(evidence, config),
-        _temperature_control(evidence, config),
+        _setpoint_acknowledged(replicate),
+        _hold_continuous(replicate),
+        _no_protection_trip(replicate),
+        _telemetry_coverage(run, replicate, config),
+        _temperature_control(run, replicate, config),
         _readings_complete(reconciliation, config),
         _no_unexpected_readings(reconciliation),
-        _no_saturation(evidence, reconciliation),
-        _calibration_valid(evidence, reconciliation),
+        _no_saturation(run, reconciliation),
+        _calibration_valid(run, reconciliation),
+        _no_contamination_indicator(replicate, reconciliation, config),
+        _growth_plausible(reconciliation, config),
     )
-    return CultureQCReport(passed=all(check.passed for check in checks), checks=checks)
+    return CultureQCReport(
+        reactor_id=replicate.reactor_id,
+        passed=all(check.passed for check in checks),
+        checks=checks,
+    )
 
 
 def _check(code: str, passed: bool, ok: str, failed: str, **details: Any) -> CultureQCCheck:
@@ -71,7 +126,7 @@ def _check(code: str, passed: bool, ok: str, failed: str, **details: Any) -> Cul
     )
 
 
-def _setpoint_acknowledged(evidence: CultureRunEvidence) -> CultureQCCheck:
+def _setpoint_acknowledged(evidence: ReplicateEvidence) -> CultureQCCheck:
     ack = evidence.acknowledgement
     command = evidence.setpoint_command
     applied_matches = (
@@ -94,7 +149,7 @@ def _setpoint_acknowledged(evidence: CultureRunEvidence) -> CultureQCCheck:
     )
 
 
-def _no_protection_trip(evidence: CultureRunEvidence) -> CultureQCCheck:
+def _no_protection_trip(evidence: ReplicateEvidence) -> CultureQCCheck:
     tripped = [
         sample.sampled_at.isoformat()
         for sample in evidence.telemetry
@@ -110,16 +165,33 @@ def _no_protection_trip(evidence: CultureRunEvidence) -> CultureQCCheck:
 
 
 def _post_warmup(
-    evidence: CultureRunEvidence, config: CultureQCConfig
+    run: CultureRunEvidence, evidence: ReplicateEvidence, config: CultureQCConfig
 ) -> list[EnvironmentTelemetry]:
-    settled = evidence.hold_started_at + to_timedelta(config.warmup)
+    settled = run.hold_started_at + to_timedelta(config.warmup)
     return [sample for sample in evidence.telemetry if sample.sampled_at >= settled]
 
 
-def _telemetry_coverage(evidence: CultureRunEvidence, config: CultureQCConfig) -> CultureQCCheck:
-    window = _post_warmup(evidence, config)
+def _hold_continuous(evidence: ReplicateEvidence) -> CultureQCCheck:
+    return _check(
+        "hold_continuous",
+        not evidence.hold_interrupted,
+        "the device held the requested conditions throughout",
+        "AutoLab could not confirm the device kept holding across a restart",
+    )
+
+
+def _telemetry_coverage(
+    run: CultureRunEvidence, evidence: ReplicateEvidence, config: CultureQCConfig
+) -> CultureQCCheck:
+    """Coverage against the *expected* sample count, so outages count as gaps."""
+
+    window = _post_warmup(run, evidence, config)
+    settled = run.hold_started_at + to_timedelta(config.warmup)
+    span = (run.ended_at - settled).total_seconds()
+    interval = float(seconds(run.receipt.protocol.telemetry_interval))
+    expected = max(int(span // interval) + 1, 1) if span > 0 else 1
     with_value = [sample for sample in window if sample.measured_temperature is not None]
-    coverage = Decimal(len(with_value)) / Decimal(len(window)) if window else Decimal(0)
+    coverage = min(Decimal(len(with_value)) / Decimal(expected), Decimal(1))
     return _check(
         "telemetry_coverage",
         coverage >= config.minimum_telemetry_coverage,
@@ -127,14 +199,17 @@ def _telemetry_coverage(evidence: CultureRunEvidence, config: CultureQCConfig) -
         "too many missing temperature readings after warm-up",
         coverage=str(coverage),
         samples=len(window),
+        expected_samples=expected,
     )
 
 
-def _temperature_control(evidence: CultureRunEvidence, config: CultureQCConfig) -> CultureQCCheck:
+def _temperature_control(
+    run: CultureRunEvidence, evidence: ReplicateEvidence, config: CultureQCConfig
+) -> CultureQCCheck:
     setpoint = evidence.setpoint_command.temperature_setpoint.to(TEMPERATURE_UNIT).value
     values = [
         sample.measured_temperature.to(TEMPERATURE_UNIT).value
-        for sample in _post_warmup(evidence, config)
+        for sample in _post_warmup(run, evidence, config)
         if sample.measured_temperature is not None
     ]
     if not values:
@@ -182,9 +257,9 @@ def _no_unexpected_readings(reconciliation: TimeSeriesReconciliation) -> Culture
 
 
 def _no_saturation(
-    evidence: CultureRunEvidence, reconciliation: TimeSeriesReconciliation
+    run: CultureRunEvidence, reconciliation: TimeSeriesReconciliation
 ) -> CultureQCCheck:
-    capabilities = evidence.sensor_capabilities
+    capabilities = run.sensor_capabilities
     saturated: list[str] = []
     for entry in reconciliation.entries:
         measurement = entry.measurement
@@ -208,19 +283,24 @@ def _no_saturation(
 
 
 def _calibration_valid(
-    evidence: CultureRunEvidence, reconciliation: TimeSeriesReconciliation
+    run: CultureRunEvidence, reconciliation: TimeSeriesReconciliation
 ) -> CultureQCCheck:
+    # Every calibration the sensor reported across sessions, by its hash.
     calibrations = {
-        item.measurement_type: item for item in evidence.sensor_capabilities.calibrations
+        (item.measurement_type, item.calibration_sha256): item
+        for session in run.sensor_sessions
+        for item in session.calibrations
     }
     invalid: list[str] = []
     for entry in reconciliation.entries:
         measurement = entry.measurement
         if measurement is None:
             continue
-        calibration = calibrations.get(measurement.measurement_type)
+        calibration = calibrations.get(
+            (measurement.measurement_type, measurement.source_evidence.calibration_sha256 or "")
+        )
         if calibration is None:
-            if evidence.sensor_capabilities.calibration_required:
+            if run.sensor_capabilities.calibration_required:
                 invalid.append(entry.expected_measurement_id)
             continue
         expired = (
@@ -239,4 +319,74 @@ def _calibration_valid(
         "every reading was taken under a valid calibration",
         "some readings were taken outside a valid sensor calibration",
         invalid=invalid,
+    )
+
+
+def _no_contamination_indicator(
+    evidence: ReplicateEvidence,
+    reconciliation: TimeSeriesReconciliation,
+    config: CultureQCConfig,
+) -> CultureQCCheck:
+    """Device faults or sensor metadata that report suspected contamination."""
+
+    flagged = sorted(
+        {
+            fault
+            for sample in evidence.telemetry
+            for fault in sample.faults
+            if fault in config.contamination_fault_codes
+        }
+        | {
+            entry.expected_measurement_id
+            for entry in reconciliation.entries
+            if entry.measurement is not None
+            and entry.measurement.metadata.get("contamination_suspected") is True
+        }
+    )
+    return _check(
+        "no_contamination_indicator",
+        not flagged,
+        "no device or sensor contamination indicator",
+        "device or sensor reported suspected contamination",
+        indicators=flagged,
+    )
+
+
+def _growth_plausible(
+    reconciliation: TimeSeriesReconciliation,
+    config: CultureQCConfig,
+) -> CultureQCCheck:
+    """Flag OD drops and implausibly fast growth between consecutive readings.
+
+    Both are common signatures of contamination, lysis or probe fouling. The
+    limits are illustrative; this check cannot tell those causes apart.
+    """
+
+    points = [
+        (entry.measurement.measured_at, entry.measurement.raw_value, entry.expected_measurement_id)
+        for entry in reconciliation.matched()
+        if entry.measurement is not None
+    ]
+    drops: list[str] = []
+    too_fast: list[str] = []
+    for (t0, od0, _), (t1, od1, later_id) in itertools.pairwise(points):
+        if config.maximum_od_drop is not None and od0 - od1 > config.maximum_od_drop:
+            drops.append(later_id)
+        hours = Decimal(str((t1 - t0).total_seconds())) / Decimal(3600)
+        ceiling = config.maximum_specific_growth_rate_per_hour
+        if ceiling is not None and od0 > 0 and od1 > 0 and hours > 0:
+            rate = Decimal(str(math.log(float(od1 / od0)))) / hours
+            if rate > ceiling:
+                too_fast.append(later_id)
+    return _check(
+        "growth_plausible",
+        not drops and not too_fast,
+        "OD series shows no drops or implausibly fast growth",
+        "OD series looks implausible (possible contamination, lysis or probe fouling)",
+        od_drops_at=drops,
+        too_fast_at=too_fast,
+        maximum_od_drop=None if config.maximum_od_drop is None else str(config.maximum_od_drop),
+        maximum_specific_growth_rate_per_hour=None
+        if config.maximum_specific_growth_rate_per_hour is None
+        else str(config.maximum_specific_growth_rate_per_hour),
     )

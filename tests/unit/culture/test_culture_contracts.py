@@ -47,7 +47,7 @@ def _readings(
 
 
 def test_duplicate_and_unplanned_readings_are_flagged_not_counted() -> None:
-    plan = CultureProtocolCompiler().compile(proposal(), design()).measurement_plan
+    plan = CultureProtocolCompiler().compile(proposal(), design()).replicates[0].measurement_plan
     clock = SteppedClock(START)
     asyncio.run(clock.sleep_until(plan.points[0].due_at(START)))
     readings = _readings(ScriptedODSensor(clock=clock), clock, ["od-001", "od-001", "od-999"])

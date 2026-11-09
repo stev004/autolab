@@ -61,6 +61,10 @@ class CultureExecutionConfig(DomainModel):
     sensor: SensorConfig | None = None
     #: ``simulated`` skips real waiting and is refused unless the controller is simulated.
     clock: Literal["wall", "simulated"] = "wall"
+    #: What a cancelled run (Ctrl-C, shutdown) does. ``safe_state`` ends the hold;
+    #: ``keep_holding`` leaves the device under its own local control so the next
+    #: ``culture run`` resumes the culture where it left off.
+    on_interrupt: Literal["safe_state", "keep_holding"] = "safe_state"
 
     @model_validator(mode="after")
     def _no_plate_fixture(self) -> CultureExecutionConfig:

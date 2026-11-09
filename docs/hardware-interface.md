@@ -77,7 +77,10 @@ path. Adapters re-check their own limits, never retry an ambiguous command, and
 keep local protection working without AutoLab. Installed adapters are discovered
 through the `autonomous_lab.culture_controllers` entry-point group. Factories
 receive `controller_id`, `settings` and `clock`. A controller with an integrated
-OD probe exposes it through `IntegratedCultureSensor`. See [culture](culture.md).
+OD probe exposes it through `IntegratedCultureSensor`. Telemetry should report
+`active_command_id`, so AutoLab can confirm after a restart that the device is
+still holding the acknowledged command before it resumes. Without it, a resume can
+only end the hold safely. See [culture](culture.md).
 
 ## Future actuation
 

@@ -49,14 +49,25 @@ def seconds(quantity: QuantityValue) -> Decimal:
 class CultureDesign(DomainModel):
     """Campaign-level culture design: what every experiment in a campaign shares.
 
-    The optimiser varies only temperature setpoint and light. Duration and the
-    sampling schedule are fixed by the design so experiments stay comparable.
+    The optimiser varies only temperature setpoint and light. Duration, the
+    sampling schedule and the replicate layout are fixed by the design so
+    experiments stay comparable.
+
+    Biological replicates: every reactor in ``reactor_ids`` receives the same
+    conditions at the same time. Each replicate is quality-checked on its own;
+    the experiment counts only if at least ``minimum_passing_replicates`` pass,
+    and the optimiser learns from their mean.
+
+    Schedule: either a regular ``sampling_interval`` (readings every interval and
+    at the end) or explicit ``sample_offsets`` (for example denser early on).
     """
 
     schema_version: Literal["1"] = "1"
-    reactor_id: str = Field(min_length=1)
+    reactor_ids: tuple[str, ...]
+    minimum_passing_replicates: int | None = Field(default=None, ge=1)
     duration: QuantityValue
-    sampling_interval: QuantityValue
+    sampling_interval: QuantityValue | None = None
+    sample_offsets: tuple[QuantityValue, ...] | None = None
     sample_tolerance: QuantityValue
     telemetry_interval: QuantityValue
     measurement_type: str = "optical_density"
@@ -64,22 +75,59 @@ class CultureDesign(DomainModel):
     wavelength: QuantityValue = QuantityValue(value=Decimal(750), unit="nanometer")
 
     @model_validator(mode="after")
-    def _coherent_schedule(self) -> CultureDesign:
+    def _coherent_design(self) -> CultureDesign:
+        if not self.reactor_ids or any(not item.strip() for item in self.reactor_ids):
+            raise ValueError("at least one non-blank reactor ID is required")
+        if len(set(self.reactor_ids)) != len(self.reactor_ids):
+            raise ValueError("each replicate needs its own reactor")
+        if self.minimum_passing_replicates is not None and self.minimum_passing_replicates > len(
+            self.reactor_ids
+        ):
+            raise ValueError("minimum_passing_replicates exceeds the number of reactors")
         duration = seconds(self.duration)
-        interval = seconds(self.sampling_interval)
         tolerance = seconds(self.sample_tolerance)
-        telemetry = seconds(self.telemetry_interval)
         self.wavelength.to("nanometer")
-        if duration <= 0 or interval <= 0 or telemetry <= 0:
-            raise ValueError("duration, sampling and telemetry intervals must be positive")
+        if duration <= 0 or seconds(self.telemetry_interval) <= 0:
+            raise ValueError("duration and telemetry interval must be positive")
         if tolerance < 0:
             raise ValueError("sample tolerance cannot be negative")
-        if interval > duration:
-            raise ValueError("sampling interval cannot exceed the culture duration")
+        if (self.sampling_interval is None) == (self.sample_offsets is None):
+            raise ValueError("give exactly one of sampling_interval or sample_offsets")
+        offsets = self.offsets_seconds()
+        if offsets[0] <= 0 or offsets[-1] > duration:
+            raise ValueError("sample offsets must lie after the start and within the hold")
+        if offsets != sorted(set(offsets)):
+            raise ValueError("sample offsets must be strictly increasing")
         # Two windows must never overlap, or one reading could satisfy two entries.
-        if 2 * tolerance >= interval:
-            raise ValueError("sample tolerance must be less than half the sampling interval")
+        gaps = [
+            later - earlier
+            for earlier, later in zip((Decimal(0), *offsets[:-1]), offsets, strict=True)
+        ]
+        if 2 * tolerance >= min(gaps):
+            raise ValueError("sample tolerance must be less than half the smallest sample gap")
         return self
+
+    @property
+    def required_passing_replicates(self) -> int:
+        return self.minimum_passing_replicates or len(self.reactor_ids)
+
+    def offsets_seconds(self) -> list[Decimal]:
+        """Sample times after the hold starts, in seconds."""
+
+        if self.sample_offsets is not None:
+            return [seconds(item) for item in self.sample_offsets]
+        assert self.sampling_interval is not None
+        duration = seconds(self.duration)
+        interval = seconds(self.sampling_interval)
+        if interval <= 0:
+            raise ValueError("sampling interval must be positive")
+        offsets: list[Decimal] = []
+        current = interval
+        while current < duration:
+            offsets.append(current)
+            current += interval
+        offsets.append(duration)
+        return offsets
 
 
 class HoldConditionsCommand(DomainModel):
@@ -141,6 +189,14 @@ class TimeSeriesMeasurementPlan(DomainModel):
         return self
 
 
+class CultureReplicate(DomainModel):
+    """One biological replicate: its own reactor, hold command and sampling plan."""
+
+    replicate_index: int = Field(ge=0)
+    hold: HoldConditionsCommand
+    measurement_plan: TimeSeriesMeasurementPlan
+
+
 class CultureProtocol(DomainModel):
     """Immutable, device-neutral culture recipe derived from one proposal."""
 
@@ -153,8 +209,9 @@ class CultureProtocol(DomainModel):
     compiler_name: str
     compiler_version: str
     design_hash: str
-    hold: HoldConditionsCommand
-    measurement_plan: TimeSeriesMeasurementPlan
+    replicates: tuple[CultureReplicate, ...]
+    minimum_passing_replicates: int = Field(ge=1)
+    telemetry_interval: QuantityValue
     created_at: datetime = Field(default_factory=utc_now)
     protocol_hash: str | None = None
 
@@ -162,6 +219,23 @@ class CultureProtocol(DomainModel):
     @classmethod
     def _utc_created_at(cls, value: datetime) -> datetime:
         return require_utc(value)
+
+    @model_validator(mode="after")
+    def _consistent_replicates(self) -> CultureProtocol:
+        if not self.replicates:
+            raise ValueError("a culture protocol needs at least one replicate")
+        reactors = [item.hold.reactor_id for item in self.replicates]
+        if len(set(reactors)) != len(reactors):
+            raise ValueError("replicates must use distinct reactors")
+        if [item.replicate_index for item in self.replicates] != list(range(len(reactors))):
+            raise ValueError("replicate indices must be 0..n-1 in order")
+        if self.minimum_passing_replicates > len(self.replicates):
+            raise ValueError("minimum_passing_replicates exceeds the replicate count")
+        return self
+
+    @property
+    def duration(self) -> QuantityValue:
+        return self.replicates[0].hold.duration
 
     def compute_hash(self) -> str:
         """Hash everything except the circular hash field itself."""
@@ -180,6 +254,7 @@ class CulturePolicy(DomainModel):
     maximum_duration: QuantityValue
     minimum_sampling_interval: QuantityValue
     maximum_sample_points: int = Field(ge=1)
+    maximum_replicates: int = Field(default=8, ge=1)
     #: Setpoints must stay this far below the device's own over-temperature trip.
     minimum_trip_margin: QuantityValue = QuantityValue(
         value=Decimal(2), unit="delta_degree_Celsius"
@@ -243,10 +318,23 @@ class ExecutableCultureProtocol(DomainModel):
 
 
 class CultureQCConfig(DomainModel):
-    """Run-integrity thresholds. These are illustrative defaults, not validated limits."""
+    """Run-integrity thresholds. These are illustrative defaults, not validated limits.
+
+    Contamination handling uses three signals, none of which is proof on its own:
+    device or sensor fault codes (``contamination_fault_codes``), an OD drop between
+    consecutive readings larger than ``maximum_od_drop`` (lysis, grazing or probe
+    fouling), and an apparent specific growth rate above a plausibility ceiling
+    (often a faster-growing contaminant or a fouled probe). Set a limit to ``None``
+    to disable that check.
+    """
 
     warmup: QuantityValue = QuantityValue(value=Decimal(3), unit="hour")
     maximum_mean_temperature_deviation: FiniteDecimal = Field(default=Decimal(1), gt=0)
     minimum_telemetry_coverage: FiniteDecimal = Field(default=Decimal("0.9"), gt=0, le=1)
     maximum_missing_reading_fraction: FiniteDecimal = Field(default=Decimal("0.1"), ge=0, le=1)
     require_final_reading: bool = True
+    contamination_fault_codes: frozenset[str] = frozenset({"contamination_suspected"})
+    maximum_od_drop: FiniteDecimal | None = Field(default=Decimal("0.05"), ge=0)
+    maximum_specific_growth_rate_per_hour: FiniteDecimal | None = Field(
+        default=Decimal("0.5"), gt=0
+    )

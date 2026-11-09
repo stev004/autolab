@@ -25,6 +25,7 @@ from autonomous_lab.culture.models import (
     CultureDesign,
     CulturePolicy,
     CultureProtocol,
+    CultureReplicate,
     ExecutableCultureProtocol,
     seconds,
 )
@@ -117,23 +118,44 @@ class CultureValidationService:
             issues.append(_error("uncompilable_proposal", "parameter_values", rule, str(exc)))
             return issues
         # Compare the scientific content, not per-instance IDs and timestamps.
-        if protocol.hold != expected.hold:
+        if [item.hold for item in protocol.replicates] != [
+            item.hold for item in expected.replicates
+        ]:
             issues.append(
                 _error(
                     "hold_not_from_proposal",
-                    "hold",
+                    "replicates[].hold",
                     rule,
-                    "hold conditions differ from what the proposal compiles to",
-                    expected=expected.hold.model_dump(mode="json"),
+                    "hold conditions or reactors differ from what the proposal compiles to",
                 )
             )
-        if protocol.measurement_plan != expected.measurement_plan:
+        if [item.measurement_plan for item in protocol.replicates] != [
+            item.measurement_plan for item in expected.replicates
+        ]:
             issues.append(
                 _error(
                     "plan_not_from_design",
-                    "measurement_plan",
+                    "replicates[].measurement_plan",
                     rule,
                     "sampling plan differs from what the design compiles to",
+                )
+            )
+        if protocol.telemetry_interval != expected.telemetry_interval:
+            issues.append(
+                _error(
+                    "plan_not_from_design",
+                    "telemetry_interval",
+                    rule,
+                    "telemetry interval differs from the design",
+                )
+            )
+        if protocol.minimum_passing_replicates != expected.minimum_passing_replicates:
+            issues.append(
+                _error(
+                    "replicate_rule_not_from_design",
+                    "minimum_passing_replicates",
+                    rule,
+                    "replicate acceptance rule differs from the design",
                 )
             )
         if protocol.parameter_values != proposal.parameter_values:
@@ -144,8 +166,56 @@ class CultureValidationService:
 
 
 def _policy(protocol: CultureProtocol, policy: CulturePolicy) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    if len(protocol.replicates) > policy.maximum_replicates:
+        issues.append(
+            _error(
+                "too_many_replicates",
+                "replicates",
+                "culture_policy",
+                f"{len(protocol.replicates)} replicates exceed {policy.maximum_replicates}",
+            )
+        )
+    for replicate in protocol.replicates:
+        issues += _prefixed(_policy_for(replicate, policy), replicate)
+    return _unique(issues)
+
+
+def _capability(
+    protocol: CultureProtocol,
+    policy: CulturePolicy,
+    capabilities: CultureControllerCapabilities,
+) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    for replicate in protocol.replicates:
+        issues += _prefixed(_capability_for(replicate, policy, capabilities), replicate)
+    return _unique(issues)
+
+
+def _prefixed(issues: list[ValidationIssue], replicate: CultureReplicate) -> list[ValidationIssue]:
+    return [
+        issue.model_copy(update={"path": f"replicates[{replicate.replicate_index}].{issue.path}"})
+        for issue in issues
+    ]
+
+
+def _unique(issues: list[ValidationIssue]) -> list[ValidationIssue]:
+    """Report a condition-level problem once, not once per identical replicate."""
+
+    seen: set[str] = set()
+    result: list[ValidationIssue] = []
+    for issue in issues:
+        condition_level = issue.code != "unknown_reactor"
+        key = issue.code if condition_level else f"{issue.code}:{issue.path}"
+        if key not in seen:
+            seen.add(key)
+            result.append(issue)
+    return result
+
+
+def _policy_for(replicate: CultureReplicate, policy: CulturePolicy) -> list[ValidationIssue]:
     rule = "culture_policy"
-    hold = protocol.hold
+    hold = replicate.hold
     issues = [
         *_range_issues(
             hold.temperature_setpoint,
@@ -168,7 +238,7 @@ def _policy(protocol: CultureProtocol, policy: CulturePolicy) -> list[Validation
         issues.append(
             _error("duration_exceeds_policy", "hold.duration", rule, "hold is longer than allowed")
         )
-    points = protocol.measurement_plan.points
+    points = replicate.measurement_plan.points
     if len(points) > policy.maximum_sample_points:
         issues.append(
             _error(
@@ -204,13 +274,13 @@ def _policy(protocol: CultureProtocol, policy: CulturePolicy) -> list[Validation
     return issues
 
 
-def _capability(
-    protocol: CultureProtocol,
+def _capability_for(
+    replicate: CultureReplicate,
     policy: CulturePolicy,
     capabilities: CultureControllerCapabilities,
 ) -> list[ValidationIssue]:
     rule = "culture_capability"
-    hold = protocol.hold
+    hold = replicate.hold
     issues: list[ValidationIssue] = []
     if hold.reactor_id not in capabilities.reactor_ids:
         issues.append(
