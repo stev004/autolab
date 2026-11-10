@@ -1,0 +1,12 @@
+# A research goal for `autolab agent draft` (stage 7). Free text plus optional hints.
+title: Low-energy growth near the optimum
+statement: >
+  Find temperature and light settings that keep end-point OD750 high while using
+  less energy than the first campaign's best run.
+experiment_type: culture
+max_experiments: 12
+objectives:
+  - {metric: final_od750, direction: maximize}
+  - {metric: energy_kwh, direction: minimize}
+parameter_focus:
+  temperature_setpoint: [24, 31]

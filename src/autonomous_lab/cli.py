@@ -12,8 +12,21 @@ from typing import Annotated, Never, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import typer
+import yaml
+from pydantic import ValidationError
 
-from autonomous_lab.campaigns.config import AssayDesignConfig, CampaignConfig
+from autonomous_lab.agents import CampaignDraft, ResearchGoal, TemplateResearchAgent
+from autonomous_lab.campaigns.agent_gateway import (
+    DraftReview,
+    build_digest,
+    drafting_context,
+    review_draft,
+)
+from autonomous_lab.campaigns.config import (
+    AssayDesignConfig,
+    CampaignConfig,
+    ValidationPolicyConfig,
+)
 from autonomous_lab.campaigns.culture_service import CultureCampaignService
 from autonomous_lab.campaigns.loader import (
     ConfigurationLoadError,
@@ -29,6 +42,7 @@ from autonomous_lab.campaigns.service import (
     CampaignStatus,
 )
 from autonomous_lab.culture import ControllerError
+from autonomous_lab.culture.models import CulturePolicy
 from autonomous_lab.domain.enums import ParameterScale
 from autonomous_lab.domain.experiments import ExperimentProposal
 from autonomous_lab.domain.quantities import QuantityValue
@@ -85,6 +99,14 @@ culture_app = typer.Typer(
 )
 app.add_typer(campaign_app, name="campaign")
 app.add_typer(culture_app, name="culture")
+agent_app = typer.Typer(
+    no_args_is_help=True,
+    help=(
+        "Research-agent tools (stage 7): read-only evidence digests, interpretation, "
+        "and review of untrusted campaign drafts. Nothing here runs experiments."
+    ),
+)
+app.add_typer(agent_app, name="agent")
 app.add_typer(experiment_app, name="experiment")
 experiment_app.add_typer(execution_app, name="execution")
 experiment_app.add_typer(measurements_app, name="measurements")
@@ -546,6 +568,145 @@ def flag_culture_contamination(
     finally:
         storage.close()
     typer.echo(f"flagged culture {experiment_id} as contaminated")
+
+
+def _load_mapping(path: Path) -> dict[str, object]:
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path} must contain a mapping")
+    return cast(dict[str, object], raw)
+
+
+def _policy_for(
+    document: Mapping[str, object], policy: Path | None
+) -> CulturePolicy | ValidationPolicyConfig:
+    culture = document.get("experiment_type") == "culture"
+    default = Path("configs/culture-policy.yaml" if culture else "configs/validation-policy.yaml")
+    path = policy or default
+    return load_culture_policy(path) if culture else load_validation_policy(path)
+
+
+@agent_app.command("digest")
+def agent_digest(
+    campaign_id: Annotated[UUID, typer.Argument(help="Campaign UUID (assay or culture).")],
+    database: DatabaseOption = "data/autolab.sqlite3",
+) -> None:
+    """Print a read-only JSON evidence digest of a campaign for an agent to read."""
+
+    storage = Storage.open(database)
+    try:
+        digest = build_digest(storage, campaign_id)
+    except (RecordNotFoundError, ValueError, KeyError) as exc:
+        _abort(str(exc), code=2)
+    finally:
+        storage.close()
+    typer.echo(digest.model_dump_json(indent=2))
+
+
+@agent_app.command("interpret")
+def agent_interpret(
+    campaign_id: Annotated[UUID, typer.Argument(help="Campaign UUID (assay or culture).")],
+    database: DatabaseOption = "data/autolab.sqlite3",
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Interpret a campaign with the built-in rule-based agent (no model, no cost)."""
+
+    storage = Storage.open(database)
+    try:
+        interpretation = TemplateResearchAgent().interpret(build_digest(storage, campaign_id))
+    except (RecordNotFoundError, ValueError, KeyError) as exc:
+        _abort(str(exc), code=2)
+    finally:
+        storage.close()
+    if json_output:
+        typer.echo(interpretation.model_dump_json(indent=2))
+        return
+    typer.echo(interpretation.summary)
+    for finding in interpretation.findings:
+        typer.echo(f"- [{finding.confidence}] {finding.statement}")
+    for step in interpretation.suggested_next_steps:
+        typer.echo(f"next: {step}")
+    for caveat in interpretation.caveats:
+        typer.echo(f"caveat: {caveat}")
+
+
+@agent_app.command("draft")
+def agent_draft(
+    goal: Annotated[Path, typer.Argument(exists=True, dir_okay=False, help="Research goal YAML.")],
+    template: Annotated[
+        Path, typer.Option("--template", exists=True, dir_okay=False, help="Known-good campaign.")
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o", help="Where to write the draft.")],
+    policy: Annotated[Path | None, typer.Option("--policy", exists=True, dir_okay=False)] = None,
+) -> None:
+    """Draft a campaign with the rule-based agent, then review it."""
+
+    try:
+        template_document = _load_mapping(template)
+        trusted = _policy_for(template_document, policy)
+        draft = TemplateResearchAgent().draft_campaign(
+            ResearchGoal.model_validate(_load_mapping(goal), strict=False),
+            drafting_context(template_document, trusted),
+        )
+        review = review_draft(draft, policy=trusted, template=template_document)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            yaml.safe_dump(draft.model_dump(mode="json"), sort_keys=False), encoding="utf-8"
+        )
+    except (ConfigurationLoadError, ValidationError, ValueError, OSError) as exc:
+        _abort(str(exc), code=2)
+    typer.echo(f"wrote draft: {output}")
+    _emit_review(review)
+
+
+@agent_app.command("review")
+def agent_review(
+    draft_path: Annotated[
+        Path, typer.Argument(exists=True, dir_okay=False, help="CampaignDraft YAML/JSON.")
+    ],
+    policy: Annotated[Path | None, typer.Option("--policy", exists=True, dir_okay=False)] = None,
+    template: Annotated[
+        Path | None,
+        typer.Option("--template", exists=True, dir_okay=False, help="Template it was based on."),
+    ] = None,
+    write_config: Annotated[
+        Path | None,
+        typer.Option("--write-config", help="If accepted, write campaign YAML here."),
+    ] = None,
+) -> None:
+    """Review an untrusted campaign draft (from any agent) against the trusted policy.
+
+    Exit code 0 means accepted, 2 means rejected. Accepted campaign YAML records the
+    draft's author and hash; a person still runs `culture create` / `campaign create`.
+    """
+
+    try:
+        draft = CampaignDraft.model_validate(_load_mapping(draft_path), strict=False)
+        trusted = _policy_for(draft.document, policy)
+        review = review_draft(
+            draft,
+            policy=trusted,
+            template=None if template is None else _load_mapping(template),
+        )
+    except (ConfigurationLoadError, ValidationError, ValueError, OSError) as exc:
+        _abort(f"draft could not be read: {exc}", code=2)
+    _emit_review(review)
+    if review.accepted and write_config is not None:
+        assert review.campaign_yaml is not None
+        write_config.parent.mkdir(parents=True, exist_ok=True)
+        write_config.write_text(review.campaign_yaml, encoding="utf-8")
+        typer.echo(f"wrote campaign config: {write_config}")
+    if not review.accepted:
+        raise typer.Exit(code=2)
+
+
+def _emit_review(review: DraftReview) -> None:
+    verdict = "ACCEPTED" if review.accepted else "REJECTED"
+    typer.echo(f"review: {verdict} ({review.experiment_type})")
+    for error in review.errors:
+        typer.echo(f"ERROR {error}")
+    for warning in review.warnings:
+        typer.echo(f"WARNING {warning}")
 
 
 @experiment_app.command("worklist")

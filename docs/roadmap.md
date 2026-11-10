@@ -54,10 +54,19 @@ contamination handling and biological replicate semantics. See [culture](culture
 Not claimed: unattended physical culture, validated thresholds, or any real
 bioreactor run. Batch proposals across reactors belong to stage 8.
 
-## Stage 7 - research-agent layer
+## Stage 7 - research-agent layer (first slice implemented)
 
 Add literature retrieval, structured hypothesis/campaign drafts and result
 interpretation. Agents remain outside validation and device execution.
+See [agents](agents.md).
+
+- **Implemented:** the agent boundary (research goal, campaign draft, evidence digest,
+  interpretation), a rule-based `TemplateResearchAgent`, a draft review gate using the
+  same strict validation and trusted policy as hand-written campaigns, and the
+  `autolab agent digest/interpret/draft/review` commands. A Claude Code skill lets
+  Claude Code act as the research agent with no API calls.
+- **Later:** a model-backed agent behind the same protocol, an MCP server, and
+  literature retrieval.
 
 ## Stage 8 - reproducible discovery campaigns
 

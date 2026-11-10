@@ -23,3 +23,5 @@ data/worklists/*
 !data/worklists/.gitkeep
 data/artifacts/*
 !data/artifacts/.gitkeep
+# Untrusted research-agent drafts (review before use)
+data/agent-drafts/

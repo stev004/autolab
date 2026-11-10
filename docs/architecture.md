@@ -74,7 +74,9 @@ bounds, and physical interlocks form progressively lower safety layers. A campai
 cannot weaken installation policy.
 
 The research-agent boundary accepts structured campaign drafts and summaries only.
-It has no reference to the orchestrator or device registry.
+It has no reference to the orchestrator or device registry. `campaigns/agent_gateway.py`
+gives agents read-only evidence digests and reviews their drafts with the same strict
+validation and trusted policy as hand-written campaigns.
 
 ## Failure model
 

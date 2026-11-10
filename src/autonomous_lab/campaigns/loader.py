@@ -75,6 +75,25 @@ def load_culture_campaign(path: str | Path) -> LoadedCultureCampaign:
     )
 
 
+def validate_campaign_document(
+    raw: dict[str, Any], *, source: str
+) -> CampaignConfig | CultureCampaignConfig:
+    """Validate an in-memory campaign document with the same strict rules as a file.
+
+    Used to review agent drafts: there is no separate, weaker path for them.
+    """
+
+    path = Path(source)
+    if raw.get("experiment_type", "assay") == "culture":
+        return _validate_json_semantics(CultureCampaignConfig, raw, path)
+    if "experiment_type" in raw and raw["experiment_type"] != "assay":
+        raise ConfigurationLoadError(
+            f"{source}: unknown experiment_type {raw['experiment_type']!r}"
+        )
+    without_type = {key: value for key, value in raw.items() if key != "experiment_type"}
+    return _validate_json_semantics(CampaignConfig, without_type, path)
+
+
 def load_culture_policy(path: str | Path) -> CulturePolicy:
     """Load the trusted culture installation policy (not part of any campaign)."""
 

@@ -38,8 +38,9 @@ uv run autolab campaign report "$CID" --database data/autolab.sqlite3
   sampling, contamination screens, a run journal and resume across restarts. So far
   only scripted contract fakes have driven it, and thresholds are illustrative. See
   [culture](docs/culture.md).
-- `src/autonomous_lab/agents/` is a placeholder: it defines the typed contract for a
-  future research agent, and no agent implementation exists.
+- Stage 7 (research agents) has a first slice: a rule-based agent and `autolab agent`
+  tools that let Claude Code draft and interpret campaigns as an untrusted proposer.
+  No model API is called. See [agents](docs/agents.md).
 - Requires Python 3.12 or newer.
 
 ## Overview
@@ -194,6 +195,7 @@ private state. See the
 - [Protocol and validation](docs/protocol-and-validation.md)
 - [Hardware interface](docs/hardware-interface.md)
 - [Biological culture](docs/culture.md)
+- [Research agents](docs/agents.md)
 - [Provenance](docs/provenance.md)
 - [Roadmap](docs/roadmap.md)
 

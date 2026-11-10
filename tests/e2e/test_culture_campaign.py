@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from dataclasses import dataclass, field
 from datetime import timedelta
 from decimal import Decimal
@@ -567,3 +568,137 @@ def test_contamination_flag_excludes_a_run_from_the_report(tmp_path: Path) -> No
     assert report["contamination_flags"][0]["reason"] == "ciliates seen under microscope"  # type: ignore[index]
     assert report["contamination_note"] is not None
     del storage
+
+
+def test_agent_reads_a_real_campaign_and_its_draft_becomes_a_creatable_campaign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stage 7 end to end: digest -> interpret -> draft -> review -> person creates."""
+
+    rig = ScriptedRig()
+    monkeypatch.setattr(culture_service_module, "installed_rig", rig)
+    monkeypatch.setattr(
+        culture_service_module, "default_clock", lambda _config: SteppedClock(START)
+    )
+    database = str(tmp_path / "agent.sqlite3")
+    policy_path = str(PROJECT_ROOT / "configs" / "culture-policy.yaml")
+    template = _write(tmp_path, _document())
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--database", database]).exit_code == 0
+    campaign_id = runner.invoke(
+        app,
+        [
+            "culture",
+            "create",
+            str(template),
+            "--database",
+            database,
+            "--policy",
+            policy_path,
+            "--optimizer-root",
+            str(tmp_path / "opt"),
+            "--id-only",
+        ],
+    ).output.strip()
+    ran = runner.invoke(
+        app,
+        [
+            "culture",
+            "run",
+            campaign_id,
+            "--database",
+            database,
+            "--policy",
+            policy_path,
+            "--optimizer-root",
+            str(tmp_path / "opt"),
+            "--artifact-root",
+            str(tmp_path / "art"),
+            "--quiet",
+        ],
+    )
+    assert ran.exit_code == 0, ran.output
+
+    digest = runner.invoke(app, ["agent", "digest", campaign_id, "--database", database])
+    assert digest.exit_code == 0, digest.output
+    data = json.loads(digest.output)
+    assert data["experiment_type"] == "culture" and len(data["experiments"]) == 4
+    assert all(item["metrics"]["final_od750"] > 0 for item in data["experiments"])
+    assert "uri" not in digest.output and "sqlite" not in digest.output  # values only
+
+    interpreted = runner.invoke(app, ["agent", "interpret", campaign_id, "--database", database])
+    assert interpreted.exit_code == 0 and "Best final_od750" in interpreted.output
+
+    goal = tmp_path / "goal.yaml"
+    goal.write_text(
+        yaml.safe_dump(
+            {
+                "title": "Follow-up near the optimum",
+                "statement": "Narrow temperature around the best result.",
+                "experiment_type": "culture",
+                "max_experiments": 3,
+                "parameter_focus": {"temperature_setpoint": [26, 30]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    draft_path = tmp_path / "draft.yaml"
+    drafted = runner.invoke(
+        app,
+        [
+            "agent",
+            "draft",
+            str(goal),
+            "--template",
+            str(template),
+            "--output",
+            str(draft_path),
+            "--policy",
+            policy_path,
+        ],
+    )
+    assert drafted.exit_code == 0 and "ACCEPTED" in drafted.output, drafted.output
+
+    accepted = tmp_path / "follow-up.yaml"
+    reviewed = runner.invoke(
+        app,
+        [
+            "agent",
+            "review",
+            str(draft_path),
+            "--policy",
+            policy_path,
+            "--template",
+            str(template),
+            "--write-config",
+            str(accepted),
+        ],
+    )
+    assert reviewed.exit_code == 0, reviewed.output
+    created = runner.invoke(
+        app,
+        [
+            "culture",
+            "create",
+            str(accepted),
+            "--database",
+            database,
+            "--policy",
+            policy_path,
+            "--optimizer-root",
+            str(tmp_path / "opt"),
+            "--id-only",
+        ],
+    )
+    assert created.exit_code == 0, created.output
+    # The agent's provenance travels with the campaign source text.
+    with Storage(Database(tmp_path / "agent.sqlite3")).unit_of_work() as uow:
+        source = uow.campaigns.get(created.output.strip()).config_source
+    assert "# Drafted by: autolab-template-agent@1" in source
+
+    # A tampered draft is refused with exit code 2.
+    tampered = yaml.safe_load(draft_path.read_text(encoding="utf-8"))
+    tampered["document"]["parameter_space"]["temperature_setpoint"]["maximum"] = 40
+    draft_path.write_text(yaml.safe_dump(tampered), encoding="utf-8")
+    refused = runner.invoke(app, ["agent", "review", str(draft_path), "--policy", policy_path])
+    assert refused.exit_code == 2 and "REJECTED" in refused.output

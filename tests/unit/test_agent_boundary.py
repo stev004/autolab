@@ -11,6 +11,12 @@ def test_research_agent_package_cannot_import_execution_layers() -> None:
         "autonomous_lab.orchestration",
         "autonomous_lab.protocols",
         "autonomous_lab.validation",
+        # Stage 7: agents also get no storage, campaign, culture or optimiser handle.
+        "autonomous_lab.campaigns",
+        "autonomous_lab.storage",
+        "autonomous_lab.culture",
+        "autonomous_lab.optimization",
+        "autonomous_lab.simulation",
     }
 
     for source_path in root.glob("*.py"):
