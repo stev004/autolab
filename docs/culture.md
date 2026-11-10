@@ -41,7 +41,7 @@ unchanged.
 
 ```mermaid
 flowchart TD
-    P["ExperimentProposal: temperature_setpoint, light_intensity"] --> C["CultureProtocolCompiler"]
+    P["ExperimentProposal: optimised variables (e.g. temperature, light_intensity, ph)"] --> C["CultureProtocolCompiler"]
     D["CultureDesign: reactors (replicates), duration, schedule, telemetry interval"] --> C
     C --> PR["CultureProtocol: one hold command + sampling plan per replicate"]
     PR --> V["CultureValidationService: binding, policy, device capability"]
@@ -107,18 +107,60 @@ reading can never satisfy two plan entries. The final reading must coincide with
 the end of the hold. Telemetry is polled every `telemetry_interval` and at both
 ends of the hold.
 
+## Controlled variables (contract v2)
+
+The environment is a set of **named controlled variables**. The device declares them
+in its manifest (`controlled_variables`), each with a unit, a range (with optional
+resolution) and `tracked`, meaning the device reports a measured value. It also
+declares `protection_limits`, the trip points it enforces locally, and `resources`,
+the cumulative consumption counters it reports (for example `energy`, `co2`).
+**The manifest is the source of truth for what a device can do**, and the
+installation policy (`setpoint_limits`) bounds what AutoLab allows. The effective
+range for each variable is policy ∩ device.
+
+| Known variable | Unit | Notes |
+| --- | --- | --- |
+| `temperature` | `degree_Celsius` | intervals in `delta_degree_Celsius` |
+| `light_intensity` | `micromole / meter ** 2 / second` | |
+| `ph` | `dimensionless` | held by the device through CO2 dosing |
+
+Other variable names work if a device declares them; these three just get a unit
+check up front.
+
+- **Campaign parameters *are* variable names.** Variables not being optimised are
+  held constant with `culture_design.fixed_setpoints`, for example `{ph: 7.5}`.
+- **Exact key set.** Optimised plus fixed variables must equal the device's
+  controlled variables exactly. The device rejects unknown and missing variables,
+  since it has nothing to hold a missing one at.
+- **Fail fast.** When a culture campaign starts, every search range and fixed
+  setpoint must lie inside both the policy and the device range. A heater-only
+  device that cannot go below 20 °C refuses a campaign searching 18–34 °C before it
+  runs any experiment, instead of rejecting proposals one by one.
+- **Resources become metrics.** `energy` becomes `energy_kwh` and `co2` becomes
+  `co2_g`. Both are device-attested and objectives typically minimise them.
+
+pH is **not** an independent knob. In a photobioreactor the device doses CO2 to hold
+a pH setpoint: CO2 can only lower pH, and photosynthetic carbon uptake raises it. So
+pH is a controlled variable and CO2 used is a measured consumption.
+
 ## Validation rules
 
 - **Binding**: the compiler is trusted, and the protocol hash, experiment, proposal
   hash and design hash all match. Every replicate's hold command, every sampling
   plan, the telemetry interval and the replicate rule must equal a fresh
   compilation.
-- **Policy**: setpoint and light are within the installation's ranges and
-  resolution. Duration, sample count, sample spacing and the replicate count
-  (`maximum_replicates`) are bounded. The final reading falls at the end of the hold.
-- **Device capability**: every reactor exists on the controller. Setpoint, light and
-  duration are within the controller's manifest. The setpoint stays at least
-  `minimum_trip_margin` below the device's own over-temperature trip.
+- **Policy**: every setpoint is a variable the policy allows (`setpoint_limits`), and
+  within its range and resolution. Duration, sample count, sample spacing and the
+  replicate count (`maximum_replicates`) are bounded. The final reading falls at the
+  end of the hold.
+- **Device capability**:
+  - every reactor exists on the controller;
+  - the setpoints name exactly the device's controlled variables;
+  - each setpoint is within its declared range and resolution, and the duration is
+    within the device's maximum;
+  - each setpoint stays at least `minimum_protection_margins[name]` inside that
+    variable's protection limits, for example 2 °C below a 39 °C over-temperature
+    trip and 0.3 inside pH trips at 5.5 and 9.8.
 
 The receipt binds the protocol, policy and capability hashes. Before sending
 anything, the runner fetches the manifest again and refuses with `receipt_stale` if
@@ -132,9 +174,14 @@ physical world, so it has more obligations than `ReadOnlySensor`:
 - `apply_setpoints` returns a `SetpointAcknowledgement` carrying the **applied**
   values. QC fails the replicate if they differ from the requested values.
 - The adapter re-checks its own limits even after upstream validation passed.
-- `read_telemetry` reports only what the device can attest to: measured
-  temperature (`None` when the probe drops out), applied setpoints, protection
-  trips, cumulative energy and fault codes. It should also report
+- `read_telemetry` reports only what the device can attest to:
+  - `applied` setpoints;
+  - `measured` values for tracked variables (`None` when a probe drops out);
+  - cumulative `consumption` per resource;
+  - protection trips, plus fault codes naming the limit, such as
+    `over_temperature_trip`, `ph_low_trip` or `ph_high_trip`.
+
+  It should also report
   `active_command_id`, the command it is holding; without it AutoLab cannot resume
   a hold after a restart and can only end it safely.
 - `enter_safe_state` is requested for every reactor that may have received a
@@ -220,8 +267,8 @@ is left for a later stage.
 | `setpoint_acknowledged` | the device did not accept the setpoints, or applied different values |
 | `hold_continuous` | the device could not confirm it kept holding across a restart |
 | `no_protection_trip` | any telemetry sample reports a trip |
-| `telemetry_coverage` | too few post-warm-up samples (against the *expected* count) have a measured temperature |
-| `temperature_control` | the mean absolute deviation from the setpoint after warm-up exceeds the limit |
+| `telemetry_coverage:<variable>` | for each tracked variable, too few samples after that variable's warm-up (against the *expected* count) have a measured value |
+| `control:<variable>` | for each tracked variable, the mean absolute deviation from its setpoint after its warm-up (`tracking_warmups`) exceeds `tracking_tolerances` (defaults: temperature 1 °C, pH 0.2). A tracked variable with no tolerance configured fails rather than passing unchecked |
 | `readings_complete` | too many plan entries are missing or out of window, or the final reading is missing |
 | `no_unexpected_readings` | a reading is a duplicate or matches no plan entry |
 | `no_sensor_saturation` | a reading is flagged saturated or sits at the sensor range limit |

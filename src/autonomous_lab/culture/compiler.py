@@ -5,9 +5,6 @@ from __future__ import annotations
 from uuid import UUID
 
 from autonomous_lab.culture.models import (
-    CULTURE_PARAMETERS,
-    LIGHT_PARAMETER,
-    TEMPERATURE_PARAMETER,
     CultureDesign,
     CultureProtocol,
     CultureReplicate,
@@ -40,17 +37,22 @@ class CultureProtocolCompiler:
 
     def compile(self, proposal: ExperimentProposal, design: CultureDesign) -> CultureProtocol:
         values = proposal.parameter_values
-        if frozenset(values) != CULTURE_PARAMETERS:
+        overlap = set(values) & set(design.fixed_setpoints)
+        if overlap:
             raise CultureCompilationError(
-                f"culture proposals need exactly {sorted(CULTURE_PARAMETERS)}; got {sorted(values)}"
+                f"variables are both optimised and fixed: {sorted(overlap)}"
             )
+        # Optimised values from the proposal plus the design's fixed setpoints.
+        # Whether this is exactly the device's variable set is a validation rule.
+        setpoints = {**design.fixed_setpoints, **values}
+        if not setpoints:
+            raise CultureCompilationError("a culture needs at least one setpoint")
         replicates = tuple(
             CultureReplicate(
                 replicate_index=index,
                 hold=HoldConditionsCommand(
                     reactor_id=reactor_id,
-                    temperature_setpoint=values[TEMPERATURE_PARAMETER],
-                    light_intensity=values[LIGHT_PARAMETER],
+                    setpoints=dict(sorted(setpoints.items())),
                     duration=design.duration,
                 ),
                 measurement_plan=build_sampling_plan(

@@ -1,4 +1,4 @@
-"""Wire contracts for long-running culture experiments (roadmap stage 6, slice A).
+"""Wire contracts for long-running culture experiments (roadmap stage 6, contract v2).
 
 A culture experiment is deliberately *not* an assay ``ExperimentProtocol``. An
 assay is a short sequence of liquid-handling steps ending in one plate read; a
@@ -6,6 +6,12 @@ culture holds environmental conditions for hours and samples a time series while
 it does. Forcing both into one step union would weaken validation for each, so
 the culture path has its own protocol, plan and receipt while reusing AutoLab's
 proposal, quantity, validation-issue and hashing types unchanged.
+
+Contract v2: the environment is a set of *named controlled variables* (for example
+``temperature``, ``light_intensity``, ``ph``) that the device declares in its
+manifest, each with a unit, range and whether the device reports a measured value.
+Adding a variable is configuration, not code. The device manifest is the source of
+truth for what a device can do; the installation policy bounds what AutoLab allows.
 
 Every model is frozen and hashable so the evidence chain can bind exact values.
 """
@@ -29,11 +35,53 @@ TEMPERATURE_UNIT = "degree_Celsius"
 LIGHT_UNIT = "micromole / meter ** 2 / second"
 ENERGY_UNIT = "kilowatt_hour"
 
-#: Proposal parameter names a culture protocol consumes. Optimisers choose these
-#: scientific conditions; they never choose device commands.
-TEMPERATURE_PARAMETER = "temperature_setpoint"
-LIGHT_PARAMETER = "light_intensity"
-CULTURE_PARAMETERS = frozenset({TEMPERATURE_PARAMETER, LIGHT_PARAMETER})
+#: Canonical units for the controlled variables AutoLab knows by name. Other names
+#: are allowed if a device declares them; these just get a unit check up front.
+KNOWN_VARIABLE_UNITS: dict[str, str] = {
+    "temperature": TEMPERATURE_UNIT,
+    "light_intensity": LIGHT_UNIT,
+    "ph": "dimensionless",
+}
+
+#: Device consumption counters -> the scientific metric they produce and its unit.
+RESOURCE_METRICS: dict[str, tuple[str, str]] = {
+    "energy": ("energy_kwh", ENERGY_UNIT),
+    "co2": ("co2_g", "gram"),
+}
+
+
+def interval_unit(unit: str) -> str:
+    """The unit for *differences* of a quantity (offset temperatures need ``delta_``)."""
+
+    return "delta_degree_Celsius" if unit == TEMPERATURE_UNIT else unit
+
+
+class ControlledVariable(DomainModel):
+    """One environmental variable a device can hold at a setpoint."""
+
+    unit: str
+    range: QuantityRange
+    #: True if the device reports a measured value (so QC can check tracking).
+    tracked: bool = False
+
+    @model_validator(mode="after")
+    def _range_in_unit(self) -> ControlledVariable:
+        self.range.minimum.to(self.unit)
+        self.range.maximum.to(self.unit)
+        return self
+
+
+class ProtectionLimit(DomainModel):
+    """A device-enforced trip point. The device acts on it locally, without AutoLab."""
+
+    minimum: QuantityValue | None = None
+    maximum: QuantityValue | None = None
+
+    @model_validator(mode="after")
+    def _at_least_one(self) -> ProtectionLimit:
+        if self.minimum is None and self.maximum is None:
+            raise ValueError("a protection limit needs a minimum or a maximum")
+        return self
 
 
 def to_timedelta(quantity: QuantityValue) -> timedelta:
@@ -64,6 +112,9 @@ class CultureDesign(DomainModel):
 
     schema_version: Literal["1"] = "1"
     reactor_ids: tuple[str, ...]
+    #: Variables held constant (not optimised), e.g. {"ph": 7.5}. Every device
+    #: variable must be either an optimised parameter or fixed here.
+    fixed_setpoints: dict[str, QuantityValue] = Field(default_factory=dict)
     minimum_passing_replicates: int | None = Field(default=None, ge=1)
     duration: QuantityValue
     sampling_interval: QuantityValue | None = None
@@ -131,18 +182,20 @@ class CultureDesign(DomainModel):
 
 
 class HoldConditionsCommand(DomainModel):
-    """Hold one reactor at a temperature setpoint and light level for a duration."""
+    """Hold one reactor at a set of controlled-variable setpoints for a duration."""
 
     command_type: Literal["hold_conditions"] = "hold_conditions"
     reactor_id: str = Field(min_length=1)
-    temperature_setpoint: QuantityValue
-    light_intensity: QuantityValue
+    setpoints: dict[str, QuantityValue]
     duration: QuantityValue
 
     @model_validator(mode="after")
     def _units(self) -> HoldConditionsCommand:
-        self.temperature_setpoint.to(TEMPERATURE_UNIT)
-        self.light_intensity.to(LIGHT_UNIT)
+        if not self.setpoints:
+            raise ValueError("a hold needs at least one setpoint")
+        for name, value in self.setpoints.items():
+            if name in KNOWN_VARIABLE_UNITS:
+                value.to(KNOWN_VARIABLE_UNITS[name])
         if seconds(self.duration) <= 0:
             raise ValueError("hold duration must be positive")
         return self
@@ -200,7 +253,7 @@ class CultureReplicate(DomainModel):
 class CultureProtocol(DomainModel):
     """Immutable, device-neutral culture recipe derived from one proposal."""
 
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["2"] = "2"
     protocol_id: UUID = Field(default_factory=new_uuid)
     experiment_id: UUID
     source_proposal_id: UUID
@@ -246,19 +299,17 @@ class CultureProtocol(DomainModel):
 class CulturePolicy(DomainModel):
     """Trusted installation policy. A campaign document cannot widen these limits."""
 
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["2"] = "2"
     policy_name: str
     policy_version: str
-    temperature_setpoint_range: QuantityRange
-    light_intensity_range: QuantityRange
+    #: The only variables AutoLab will set, and the range it allows for each.
+    setpoint_limits: dict[str, QuantityRange]
     maximum_duration: QuantityValue
     minimum_sampling_interval: QuantityValue
     maximum_sample_points: int = Field(ge=1)
     maximum_replicates: int = Field(default=8, ge=1)
-    #: Setpoints must stay this far below the device's own over-temperature trip.
-    minimum_trip_margin: QuantityValue = QuantityValue(
-        value=Decimal(2), unit="delta_degree_Celsius"
-    )
+    #: Setpoints must stay at least this far inside each device protection limit.
+    minimum_protection_margins: dict[str, QuantityValue] = Field(default_factory=dict)
     trusted_compilers: frozenset[str] = frozenset({"culture_hold_compiler@1.0.0"})
 
     @property
@@ -273,26 +324,40 @@ class CultureControllerCapabilities(DomainModel):
     different limits at dispatch time, the receipt no longer applies.
     """
 
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["2"] = "2"
     controller_id: str = Field(min_length=1)
     device_type: str
     adapter_name: str
     adapter_version: str
     firmware_version: str | None = None
     reactor_ids: frozenset[str]
-    temperature_setpoint_range: QuantityRange
-    light_intensity_range: QuantityRange
+    controlled_variables: dict[str, ControlledVariable]
+    protection_limits: dict[str, ProtectionLimit] = Field(default_factory=dict)
+    #: Cumulative consumption counters reported in telemetry, e.g. {"energy", "co2"}.
+    resources: frozenset[str] = frozenset()
     maximum_hold_duration: QuantityValue
-    over_temperature_trip: QuantityValue
     is_simulated: bool = False
     metadata: dict[str, object] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def _has_reactors(self) -> CultureControllerCapabilities:
+    def _coherent(self) -> CultureControllerCapabilities:
         if not self.reactor_ids:
             raise ValueError("controller must expose at least one reactor")
-        self.over_temperature_trip.to(TEMPERATURE_UNIT)
+        if not self.controlled_variables:
+            raise ValueError("controller must declare at least one controlled variable")
+        unknown = set(self.protection_limits) - set(self.controlled_variables)
+        if unknown:
+            raise ValueError(f"protection limits for undeclared variables: {sorted(unknown)}")
+        for name, limit in self.protection_limits.items():
+            unit = self.controlled_variables[name].unit
+            for bound in (limit.minimum, limit.maximum):
+                if bound is not None:
+                    bound.to(unit)
         return self
+
+    @property
+    def tracked_variables(self) -> tuple[str, ...]:
+        return tuple(sorted(n for n, v in self.controlled_variables.items() if v.tracked))
 
     @property
     def sha256(self) -> str:
@@ -317,8 +382,25 @@ class ExecutableCultureProtocol(DomainModel):
         return self
 
 
+def _default_warmups() -> dict[str, QuantityValue]:
+    return {
+        "temperature": QuantityValue(value=Decimal(3), unit="hour"),
+        "ph": QuantityValue(value=Decimal(3), unit="hour"),
+    }
+
+
+def _default_tolerances() -> dict[str, Decimal]:
+    return {"temperature": Decimal(1), "ph": Decimal("0.2")}
+
+
 class CultureQCConfig(DomainModel):
     """Run-integrity thresholds. These are illustrative defaults, not validated limits.
+
+    Tracking: for every variable the device reports a measured value for, QC
+    scores samples after that variable's warm-up (``tracking_warmups``, default
+    ``default_warmup``) against ``tracking_tolerances`` (mean absolute deviation
+    from the setpoint, in the variable's interval unit). A tracked variable with no
+    tolerance configured fails QC rather than passing unchecked.
 
     Contamination handling uses three signals, none of which is proof on its own:
     device or sensor fault codes (``contamination_fault_codes``), an OD drop between
@@ -328,8 +410,9 @@ class CultureQCConfig(DomainModel):
     to disable that check.
     """
 
-    warmup: QuantityValue = QuantityValue(value=Decimal(3), unit="hour")
-    maximum_mean_temperature_deviation: FiniteDecimal = Field(default=Decimal(1), gt=0)
+    default_warmup: QuantityValue = QuantityValue(value=Decimal(3), unit="hour")
+    tracking_warmups: dict[str, QuantityValue] = Field(default_factory=_default_warmups)
+    tracking_tolerances: dict[str, FiniteDecimal] = Field(default_factory=_default_tolerances)
     minimum_telemetry_coverage: FiniteDecimal = Field(default=Decimal("0.9"), gt=0, le=1)
     maximum_missing_reading_fraction: FiniteDecimal = Field(default=Decimal("0.1"), ge=0, le=1)
     require_final_reading: bool = True
@@ -338,3 +421,6 @@ class CultureQCConfig(DomainModel):
     maximum_specific_growth_rate_per_hour: FiniteDecimal | None = Field(
         default=Decimal("0.5"), gt=0
     )
+
+    def warmup_for(self, variable: str) -> QuantityValue:
+        return self.tracking_warmups.get(variable, self.default_warmup)

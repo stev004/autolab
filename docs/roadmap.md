@@ -47,6 +47,10 @@ contamination handling and biological replicate semantics. See [culture](culture
 - **Long-running state:** a run journal committed as the culture happens, resume
   across AutoLab restarts (with the device confirming it kept holding), an optional
   detach that keeps the device holding, and operator `reconcile`.
+- **Contract v2:** named controlled variables declared by the device (temperature,
+  light, pH held via CO2), fixed setpoints, per-variable tracking QC with its own
+  warm-up, resource metrics (`energy_kwh`, `co2_g`), and a fail-fast policy ∩ device
+  range check.
 - **Campaigns:** `experiment_type: culture`, `CultureCampaignService` sharing
   `CampaignLedger` with assay campaigns, and `autolab culture
   create/run/report/reconcile/flag-contamination`.

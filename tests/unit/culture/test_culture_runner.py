@@ -151,7 +151,7 @@ def test_temperature_drift_after_warmup_fails_qc() -> None:
     record, _, _ = _run(controller_kwargs={"temperature_error": drifting})
     assert record.disposition == "qc_failed"
     assert record.qc_report is not None
-    assert record.qc_report.failed_codes == ("temperature_control",)
+    assert record.qc_report.failed_codes == ("control:temperature",)
 
 
 def test_warmup_transient_is_ignored() -> None:
@@ -168,7 +168,7 @@ def test_temperature_probe_dropout_fails_telemetry_coverage() -> None:
 
     record, _, _ = _run(controller_kwargs={"temperature_error": dropout})
     assert record.qc_report is not None
-    assert "telemetry_coverage" in record.qc_report.failed_codes
+    assert "telemetry_coverage:temperature" in record.qc_report.failed_codes
 
 
 def test_applied_setpoint_that_differs_from_the_request_fails_qc() -> None:
@@ -320,3 +320,65 @@ def test_safe_state_is_requested_for_every_replicate_reactor() -> None:
     three = design(reactor_ids=("reactor-1", "reactor-2", "reactor-3"))
     asyncio.run(runner.run(proposal(), three))
     assert sorted(controller.safe_state_reactors) == ["reactor-1", "reactor-2", "reactor-3"]
+
+
+def _ph_run(**controller_kwargs: object) -> CultureExperimentRecord:
+    """A device that also holds pH by dosing CO2 (v2 controlled variables)."""
+
+    clock = SteppedClock(START)
+    controller = ScriptedController(
+        clock=clock,
+        manifest=capabilities(ph=True),
+        **controller_kwargs,  # type: ignore[arg-type]
+    )
+    runner = CultureExperimentRunner(
+        controller=controller, sensor=ScriptedODSensor(clock=clock), clock=clock, policy=policy()
+    )
+    held = design(fixed_setpoints={"ph": q("7.5", "dimensionless")})
+    return asyncio.run(runner.run(proposal(), held))
+
+
+def test_ph_is_held_tracked_and_co2_becomes_a_metric() -> None:
+    record = _ph_run()
+    assert record.disposition == "analysed", record.reason
+    assert record.evidence is not None
+    command = record.evidence.replicates[0].setpoint_command
+    assert set(command.setpoints) == {"temperature", "light_intensity", "ph"}
+    assert record.qc_report is not None
+    codes = {check.code for check in record.qc_report.replicates[0].checks}
+    assert {"control:temperature", "control:ph", "telemetry_coverage:ph"} <= codes
+    assert record.metrics is not None
+    assert record.metrics.resources["co2_g"].value == Decimal("12.0")  # 0.5 g/h for 24 h
+    assert set(record.metrics.objective_values()) == {"final_od750", "energy_kwh", "co2_g"}
+
+
+def test_ph_drift_after_its_warmup_fails_control_ph() -> None:
+    def drifts(hours: Decimal) -> Decimal:
+        return Decimal("0.01") if hours < 4 else Decimal("0.5")  # e.g. CO2 supply lost
+
+    record = _ph_run(ph_error=drifts)
+    assert record.qc_report is not None
+    assert record.qc_report.failed_codes == ("control:ph",)
+
+
+def test_ph_excursion_during_warmup_is_not_scored() -> None:
+    def settles(hours: Decimal) -> Decimal:
+        return Decimal("0.8") if hours < 2 else Decimal("0.05")
+
+    assert _ph_run(ph_error=settles).disposition == "analysed"
+
+
+def test_tracked_variable_without_a_tolerance_fails_rather_than_passing_unchecked() -> None:
+    clock = SteppedClock(START)
+    controller = ScriptedController(clock=clock, manifest=capabilities(ph=True))
+    runner = CultureExperimentRunner(
+        controller=controller,
+        sensor=ScriptedODSensor(clock=clock),
+        clock=clock,
+        policy=policy(),
+        qc_config=CultureQCConfig(tracking_tolerances={"temperature": Decimal(1)}),
+    )
+    held = design(fixed_setpoints={"ph": q("7.5", "dimensionless")})
+    record = asyncio.run(runner.run(proposal(), held))
+    assert record.qc_report is not None
+    assert record.qc_report.failed_codes == ("control:ph",)

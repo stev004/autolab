@@ -20,7 +20,15 @@ from uuid import UUID
 
 import pytest
 import yaml
-from culture_fakes import START, TEMP, ScriptedController, ScriptedODSensor, capabilities, policy
+from culture_fakes import (
+    START,
+    TEMP,
+    ScriptedController,
+    ScriptedODSensor,
+    capabilities,
+    policy,
+    variables,
+)
 from sqlalchemy import func, select
 from typer.testing import CliRunner
 
@@ -63,7 +71,7 @@ def _document(**overrides: Any) -> dict[str, Any]:
             ]
         },
         "parameter_space": {
-            "temperature_setpoint": {
+            "temperature": {
                 "kind": "continuous",
                 "unit": "degC",
                 "minimum": 20,
@@ -144,7 +152,7 @@ class _SetpointResponsiveSensor(ScriptedODSensor):
         applied = self.controller.applied[reactor_id]
         started = self.controller.started[reactor_id]
         hours = Decimal(str((self.clock.now() - started).total_seconds())) / 3600
-        setpoint = applied.temperature_setpoint.to(TEMP).value
+        setpoint = applied.setpoints["temperature"].to(TEMP).value
         rate = Decimal("0.06") - Decimal("0.004") * abs(setpoint - 28)
         return (Decimal("0.1") + max(rate, Decimal("0.001")) * hours).quantize(Decimal("0.0001"))
 
@@ -320,7 +328,7 @@ def test_assay_and_culture_paths_refuse_each_others_campaigns(tmp_path: Path) ->
         (
             {
                 "parameter_space": {
-                    "pH": {
+                    "Bad Name": {
                         "kind": "continuous",
                         "unit": "dimensionless",
                         "minimum": 6,
@@ -328,7 +336,7 @@ def test_assay_and_culture_paths_refuse_each_others_campaigns(tmp_path: Path) ->
                     }
                 }
             },
-            "optimise exactly",
+            "not a valid controlled-variable name",
         ),
     ],
 )
@@ -637,7 +645,7 @@ def test_agent_reads_a_real_campaign_and_its_draft_becomes_a_creatable_campaign(
                 "statement": "Narrow temperature around the best result.",
                 "experiment_type": "culture",
                 "max_experiments": 3,
-                "parameter_focus": {"temperature_setpoint": [26, 30]},
+                "parameter_focus": {"temperature": [26, 30]},
             }
         ),
         encoding="utf-8",
@@ -698,7 +706,48 @@ def test_agent_reads_a_real_campaign_and_its_draft_becomes_a_creatable_campaign(
 
     # A tampered draft is refused with exit code 2.
     tampered = yaml.safe_load(draft_path.read_text(encoding="utf-8"))
-    tampered["document"]["parameter_space"]["temperature_setpoint"]["maximum"] = 40
+    tampered["document"]["parameter_space"]["temperature"]["maximum"] = 40
     draft_path.write_text(yaml.safe_dump(tampered), encoding="utf-8")
     refused = runner.invoke(app, ["agent", "review", str(draft_path), "--policy", policy_path])
     assert refused.exit_code == 2 and "REJECTED" in refused.output
+
+
+def test_campaign_range_outside_the_device_is_refused_before_any_experiment(
+    tmp_path: Path,
+) -> None:
+    """Effective range = policy ∩ device: a heater-only device cannot go below 20 degC."""
+
+    document = _document()
+    document["parameter_space"]["temperature"]["minimum"] = 18  # inside the policy (18-36)
+    heater_only = capabilities(controlled_variables=variables(temperature_range=(20, 36)))
+    rig = ScriptedRig(controller_kwargs={"manifest": heater_only})
+    storage, service = _service(tmp_path, rig)
+    campaign_id = service.create(load_culture_campaign(_write(tmp_path, document)))
+    with pytest.raises(CampaignExecutionError, match="outside the device range"):
+        asyncio.run(service.run(campaign_id))
+    assert _count(storage, ExperimentRecord) == 0
+    assert service.status(campaign_id).state is CampaignState.READY
+
+
+def test_a_ph_holding_device_runs_with_ph_optimised_and_co2_minimised(tmp_path: Path) -> None:
+    document = _document()
+    document["parameter_space"]["ph"] = {
+        "kind": "continuous",
+        "unit": "dimensionless",
+        "minimum": 6.5,
+        "maximum": 8.5,
+        "resolution": 0.05,
+    }
+    document["objective"]["metrics"].append(
+        {"name": "co2_g", "direction": "minimize", "unit": "gram"}
+    )
+    rig = ScriptedRig(controller_kwargs={"manifest": capabilities(ph=True)})
+    storage, service = _service(tmp_path, rig)
+    campaign_id = service.create(load_culture_campaign(_write(tmp_path, document)))
+    status = asyncio.run(service.run(campaign_id))
+    assert status.state is CampaignState.COMPLETED and status.valid_observation_count == 4
+    with storage.unit_of_work() as uow:
+        assert uow.session is not None
+        names = set(uow.session.scalars(select(DerivedMetricRecord.name)))
+    assert names == {"final_od750", "energy_kwh", "co2_g"}
+    assert all("ph" in command.setpoints for command in rig.controllers[0].commands)

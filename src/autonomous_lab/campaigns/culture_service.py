@@ -85,6 +85,7 @@ from autonomous_lab.domain.experiments import (
 from autonomous_lab.domain.identifiers import utc_now
 from autonomous_lab.domain.optimization import OptimizationObservation, OptimizationState
 from autonomous_lab.domain.protocols import ValidationReport
+from autonomous_lab.domain.quantities import QuantityValue
 from autonomous_lab.domain.state_machines import StateTransition
 from autonomous_lab.hardware.sensors import ReadOnlySensor, load_sensor_adapter
 from autonomous_lab.optimization import (
@@ -473,6 +474,12 @@ class CultureCampaignService:
         missing = sorted(set(config.culture_design.reactor_ids) - manifest.reactor_ids)
         if missing:
             raise CampaignExecutionError(f"controller has no reactors {missing}")
+        problems = campaign_range_problems(config, self.policy, manifest)
+        if problems:
+            # Fail fast: otherwise every proposal would be rejected one by one.
+            raise CampaignExecutionError(
+                "campaign does not fit the device/policy: " + "; ".join(problems)
+            )
 
     def _close_unstarted(self, campaign_id: UUID) -> None:
         """Close experiments interrupted before dispatch could begin.
@@ -819,7 +826,7 @@ class CultureCampaignService:
                     algorithm_version="2",
                     details={
                         "replicates": {
-                            item.reactor_id: str(getattr(item, name).value)
+                            item.reactor_id: str(item.value(name).value)
                             for item in record.metrics.replicates
                         }
                     },
@@ -1095,6 +1102,54 @@ def _apply(uow: UnitOfWork, transition: StateTransition) -> None:
             else None
         ),
     )
+
+
+def campaign_range_problems(
+    config: CultureCampaignConfig,
+    policy: CulturePolicy,
+    manifest: CultureControllerCapabilities,
+) -> list[str]:
+    """Check the campaign's variables against policy ∩ device before any experiment.
+
+    The effective search range of each variable is the policy limit intersected with
+    the device's declared range. Variables (optimised plus fixed) must equal the
+    device's controlled variables exactly.
+    """
+
+    problems: list[str] = []
+    optimised = config.parameter_space.parameters
+    fixed = config.culture_design.fixed_setpoints
+    declared = set(manifest.controlled_variables)
+    used = set(optimised) | set(fixed)
+    if used != declared:
+        problems.append(
+            "variables must equal the device's controlled variables "
+            f"(missing {sorted(declared - used)}, unknown {sorted(used - declared)})"
+        )
+    for name in sorted(used & declared):
+        variable = manifest.controlled_variables[name]
+        unit = variable.unit
+        limits = [("device", variable.range)]
+        policy_limit = policy.setpoint_limits.get(name)
+        if policy_limit is None:
+            problems.append(f"the policy does not allow setting {name!r}")
+        else:
+            limits.append(("policy", policy_limit))
+        if name in optimised:
+            parameter = optimised[name]
+            low = QuantityValue(value=parameter.minimum, unit=parameter.unit).to(unit).value
+            high = QuantityValue(value=parameter.maximum, unit=parameter.unit).to(unit).value
+        else:
+            low = high = fixed[name].to(unit).value
+        for source, limit in limits:
+            minimum = limit.minimum.to(unit).value
+            maximum = limit.maximum.to(unit).value
+            if low < minimum or high > maximum:
+                problems.append(
+                    f"{name} [{low}, {high}] {unit} is outside the {source} range "
+                    f"[{minimum}, {maximum}]"
+                )
+    return problems
 
 
 def _pause_in(uow: UnitOfWork, campaign_id: UUID, optimizer_run_id: str, reason: str) -> None:

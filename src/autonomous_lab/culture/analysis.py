@@ -1,10 +1,11 @@
 """Scientific metrics from a QC-passed culture experiment.
 
-Per replicate, two direct readouts rather than fitted models:
+Per replicate, direct readouts rather than fitted models:
 
 - ``final_od750``: the matched end-point optical density (maximise);
-- ``energy_kwh``: device-attested energy used by that reactor during the hold
-  (minimise).
+- one metric per device consumption counter (``RESOURCE_METRICS``): ``energy_kwh``
+  from ``energy`` and ``co2_g`` from ``co2``, the device-attested use during the
+  hold (minimise).
 
 The experiment's value for each metric is the mean over the replicates that
 passed QC, with the between-replicate standard deviation and the standard error
@@ -20,7 +21,7 @@ import statistics
 from decimal import Decimal
 
 from autonomous_lab.culture.evidence import CultureRunEvidence
-from autonomous_lab.culture.models import ENERGY_UNIT
+from autonomous_lab.culture.models import RESOURCE_METRICS
 from autonomous_lab.culture.timeseries import TimeSeriesReconciliation
 from autonomous_lab.domain.base import DomainModel
 from autonomous_lab.domain.quantities import QuantityValue
@@ -39,8 +40,12 @@ class ODPoint(DomainModel):
 class ReplicateMetrics(DomainModel):
     reactor_id: str
     final_od750: QuantityValue
-    energy_kwh: QuantityValue
+    #: Resource metrics, e.g. {"energy_kwh": ..., "co2_g": ...}.
+    resources: dict[str, QuantityValue]
     od_series: tuple[ODPoint, ...]
+
+    def value(self, metric: str) -> QuantityValue:
+        return self.final_od750 if metric == "final_od750" else self.resources[metric]
 
 
 class MetricSummary(DomainModel):
@@ -52,9 +57,13 @@ class MetricSummary(DomainModel):
 
 class CultureMetrics(DomainModel):
     final_od750: QuantityValue
-    energy_kwh: QuantityValue
+    resources: dict[str, QuantityValue]
     replicates: tuple[ReplicateMetrics, ...]
     summaries: dict[str, MetricSummary]
+
+    @property
+    def energy_kwh(self) -> QuantityValue:
+        return self.resources["energy_kwh"]
 
     @property
     def od_series(self) -> tuple[ODPoint, ...]:
@@ -63,7 +72,7 @@ class CultureMetrics(DomainModel):
         return self.replicates[0].od_series
 
     def objective_values(self) -> dict[str, QuantityValue]:
-        return {"final_od750": self.final_od750, "energy_kwh": self.energy_kwh}
+        return {"final_od750": self.final_od750, **self.resources}
 
     def standard_errors(self) -> dict[str, Decimal]:
         return {
@@ -84,13 +93,22 @@ def analyse_culture(
         _replicate_metrics(evidence, reactor_id, reconciliations[reactor_id])
         for reactor_id in passing_reactors
     )
-    od = _summary([item.final_od750.value for item in replicates])
-    energy = _summary([item.energy_kwh.value for item in replicates])
+    summaries = {"final_od750": _summary([item.final_od750.value for item in replicates])}
+    resources: dict[str, QuantityValue] = {}
+    # Only resources every passing replicate reported, so means compare like with like.
+    shared: set[str] = set(replicates[0].resources)
+    for item in replicates[1:]:
+        shared &= set(item.resources)
+    for metric in sorted(shared):
+        unit = replicates[0].resources[metric].unit
+        summary = _summary([item.resources[metric].value for item in replicates])
+        summaries[metric] = summary
+        resources[metric] = QuantityValue(value=summary.mean, unit=unit)
     return CultureMetrics(
-        final_od750=QuantityValue(value=od.mean, unit="dimensionless"),
-        energy_kwh=QuantityValue(value=energy.mean, unit=ENERGY_UNIT),
+        final_od750=QuantityValue(value=summaries["final_od750"].mean, unit="dimensionless"),
+        resources=resources,
         replicates=replicates,
-        summaries={"final_od750": od, "energy_kwh": energy},
+        summaries=summaries,
     )
 
 
@@ -113,15 +131,24 @@ def _replicate_metrics(
     )
     telemetry = evidence.replicate(reactor_id).telemetry
     if len(telemetry) < 2:
-        raise CultureAnalysisError(f"{reactor_id}: energy needs telemetry at both ends")
-    first = telemetry[0].cumulative_energy.to(ENERGY_UNIT).value
-    last = telemetry[-1].cumulative_energy.to(ENERGY_UNIT).value
-    if last < first:
-        raise CultureAnalysisError(f"{reactor_id}: device energy counter went backwards")
+        raise CultureAnalysisError(f"{reactor_id}: resource use needs telemetry at both ends")
+    resources: dict[str, QuantityValue] = {}
+    for resource in sorted(evidence.controller_capabilities.resources):
+        if resource not in RESOURCE_METRICS:
+            continue
+        metric, unit = RESOURCE_METRICS[resource]
+        first = telemetry[0].consumption.get(resource)
+        last = telemetry[-1].consumption.get(resource)
+        if first is None or last is None:
+            raise CultureAnalysisError(f"{reactor_id}: {resource} counter missing at an end")
+        used = last.to(unit).value - first.to(unit).value
+        if used < 0:
+            raise CultureAnalysisError(f"{reactor_id}: device {resource} counter went backwards")
+        resources[metric] = QuantityValue(value=used, unit=unit)
     return ReplicateMetrics(
         reactor_id=reactor_id,
         final_od750=QuantityValue(value=series[-1].od, unit="dimensionless"),
-        energy_kwh=QuantityValue(value=last - first, unit=ENERGY_UNIT),
+        resources=resources,
         od_series=series,
     )
 

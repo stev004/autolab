@@ -19,7 +19,7 @@ from autonomous_lab.culture.controller import (
     SetpointAcknowledgement,
     SetpointCommand,
 )
-from autonomous_lab.culture.models import ExecutableCultureProtocol
+from autonomous_lab.culture.models import CultureControllerCapabilities, ExecutableCultureProtocol
 from autonomous_lab.culture.timeseries import SampleReading
 from autonomous_lab.domain.base import DomainModel
 from autonomous_lab.hardware.sensors.contracts import SensorCapabilities
@@ -56,11 +56,12 @@ class ReplicateEvidence(DomainModel):
 
 
 class CultureRunEvidence(DomainModel):
-    schema_version: Literal["2"] = "2"
+    schema_version: Literal["3"] = "3"
     run_id: UUID
     experiment_id: UUID
     receipt: ExecutableCultureProtocol
     controller_capability_sha256: str
+    controller_capabilities: CultureControllerCapabilities
     sensor_capabilities: SensorCapabilities
     hold_started_at: datetime
     ended_at: datetime

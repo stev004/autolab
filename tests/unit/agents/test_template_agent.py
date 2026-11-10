@@ -36,7 +36,7 @@ def _goal(**overrides: Any) -> ResearchGoal:
             {"metric": "energy_kwh", "direction": "minimize"},
         ],
         "max_experiments": 12,
-        "parameter_focus": {"temperature_setpoint": [24, 31]},
+        "parameter_focus": {"temperature": [24, 31]},
     }
     values.update(overrides)
     return ResearchGoal.model_validate(values, strict=False)
@@ -50,7 +50,7 @@ def _draft(goal: ResearchGoal | None = None):
 
 def test_draft_adapts_the_template_and_passes_review() -> None:
     draft = _draft()
-    space = draft.document["parameter_space"]["temperature_setpoint"]
+    space = draft.document["parameter_space"]["temperature"]
     assert (space["minimum"], space["maximum"]) == (24.0, 31.0)
     assert draft.document["campaign"]["max_experiments"] == 12
     assert draft.document["optimization"]["startup_experiments"] == 8
@@ -66,11 +66,11 @@ def test_draft_adapts_the_template_and_passes_review() -> None:
 def test_focus_can_only_narrow_and_unknown_metrics_are_dropped() -> None:
     draft = _draft(
         _goal(
-            parameter_focus={"temperature_setpoint": [10, 25], "ph": [6, 8]},
+            parameter_focus={"temperature": [10, 25], "ph": [6, 8]},
             objectives=[{"metric": "cost_per_test", "direction": "minimize"}],
         )
     )
-    space = draft.document["parameter_space"]["temperature_setpoint"]
+    space = draft.document["parameter_space"]["temperature"]
     assert space["minimum"] == 20.0 and space["maximum"] == 25.0  # clipped to the template
     assert draft.document["objective"] == TEMPLATE["objective"]
     notes = " ".join(draft.assumptions)
@@ -82,8 +82,8 @@ def test_review_rejects_ranges_outside_the_trusted_policy() -> None:
     hot = dict(draft.document)
     hot["parameter_space"] = {
         **draft.document["parameter_space"],
-        "temperature_setpoint": {
-            **draft.document["parameter_space"]["temperature_setpoint"],
+        "temperature": {
+            **draft.document["parameter_space"]["temperature"],
             "maximum": 39,
         },
     }
@@ -123,7 +123,7 @@ def _digest() -> EvidenceDigest:
             ordinal=ordinal,
             experiment_id=uuid4(),
             state=kw.pop("state", "observed"),
-            parameters={"temperature_setpoint": {"value": temp, "unit": "degC"}},
+            parameters={"temperature": {"value": temp, "unit": "degC"}},
             metrics={} if od is None else {"final_od750": od, "energy_kwh": 1.0},
             **kw,
         )
@@ -134,7 +134,7 @@ def _digest() -> EvidenceDigest:
         experiment_type="culture",
         state="completed",
         objectives=(ObjectiveHint(metric="final_od750", direction=ObjectiveDirection.MAXIMIZE),),
-        parameter_ranges={"temperature_setpoint": (20.0, 34.0)},
+        parameter_ranges={"temperature": (20.0, 34.0)},
         experiments=(
             experiment(0, 1.1, 27.0),
             experiment(1, 1.4, 28.0),
@@ -151,7 +151,7 @@ def test_interpretation_is_grounded_in_the_digest() -> None:
     # The contaminated run's high OD is excluded from "best".
     assert "Best final_od750 (maximize): 1.4" in statements
     assert "#1" in statements
-    assert "Only 7% of the temperature_setpoint range was explored" in statements
+    assert "Only 7% of the temperature range was explored" in statements
     assert "temperature_control (1)" in statements
     assert any("contaminated" in item for item in interpretation.caveats)
     assert "Simulated culture." in interpretation.caveats

@@ -1,5 +1,6 @@
-# Culture campaign: tune temperature setpoint and light for a simulated algae
-# photobioreactor, maximising end-point OD750 while minimising energy.
+# Culture campaign (contract v2): tune temperature, light and pH for a simulated
+# algae photobioreactor, maximising end-point OD750 while minimising energy and CO2.
+# pH is a setpoint the device holds by dosing CO2; CO2 used is measured.
 #
 # Requires an installed controller adapter named "algae-sim-reactor" (provided by
 # the separate algae-sim project) that integrates its own OD750 probe. The growth
@@ -20,9 +21,12 @@ objective:
     - name: energy_kwh
       direction: minimize
       unit: kilowatt_hour
+    - name: co2_g
+      direction: minimize
+      unit: gram
 
 parameter_space:
-  temperature_setpoint:
+  temperature:
     kind: continuous
     unit: degC
     minimum: 20
@@ -34,6 +38,12 @@ parameter_space:
     minimum: 30
     maximum: 400
     resolution: 1
+  ph:
+    kind: continuous
+    unit: dimensionless
+    minimum: 6.5
+    maximum: 8.5
+    resolution: 0.05
 
 culture_design:
   # Three biological replicates; at least two must pass QC for the run to count.
@@ -45,8 +55,14 @@ culture_design:
   telemetry_interval: {value: 15, unit: minute}
 
 culture_qc:
-  warmup: {value: 3, unit: hour}
-  maximum_mean_temperature_deviation: 1.0
+  # Per-variable warm-up before tracking is scored (pH settles more slowly).
+  tracking_warmups:
+    temperature: {value: 3, unit: hour}
+    ph: {value: 3, unit: hour}
+  # Mean |measured - setpoint| allowed after warm-up, per tracked variable.
+  tracking_tolerances:
+    temperature: 1.0
+    ph: 0.2
   minimum_telemetry_coverage: 0.9
   maximum_missing_reading_fraction: 0.2
   require_final_reading: true

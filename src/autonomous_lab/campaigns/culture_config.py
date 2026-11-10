@@ -12,6 +12,7 @@ overridden by this document.
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
@@ -24,11 +25,8 @@ from autonomous_lab.campaigns.config import (
     validate_grid_budget,
 )
 from autonomous_lab.culture.models import (
-    CULTURE_PARAMETERS,
-    LIGHT_PARAMETER,
-    LIGHT_UNIT,
-    TEMPERATURE_PARAMETER,
-    TEMPERATURE_UNIT,
+    KNOWN_VARIABLE_UNITS,
+    RESOURCE_METRICS,
     CultureDesign,
     CultureQCConfig,
 )
@@ -37,7 +35,10 @@ from autonomous_lab.domain.parameters import ParameterSpace
 from autonomous_lab.domain.quantities import QuantityValue
 
 #: Metrics the culture analysis actually produces. Objectives must come from here.
-CULTURE_METRICS = frozenset({"final_od750", "energy_kwh"})
+CULTURE_METRICS = frozenset(
+    {"final_od750", *(metric for metric, _unit in RESOURCE_METRICS.values())}
+)
+_VARIABLE_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 class ControllerConfig(DomainModel):
@@ -88,19 +89,26 @@ class CultureCampaignConfig(DomainModel):
     def _culture_semantics(self) -> CultureCampaignConfig:
         if self.optimization.startup_experiments > self.campaign.max_experiments:
             raise ValueError("startup_experiments cannot exceed campaign max_experiments")
-        names = frozenset(self.parameter_space.parameters)
-        if names != CULTURE_PARAMETERS:
-            raise ValueError(
-                f"culture campaigns optimise exactly {sorted(CULTURE_PARAMETERS)}; "
-                f"got {sorted(names)}"
-            )
-        for name, unit in (
-            (TEMPERATURE_PARAMETER, TEMPERATURE_UNIT),
-            (LIGHT_PARAMETER, LIGHT_UNIT),
-        ):
-            parameter = self.parameter_space.parameters[name]
+        # Parameters ARE controlled-variable names; the device must declare each one
+        # (checked when the campaign runs, against the live manifest).
+        optimised = set(self.parameter_space.parameters)
+        fixed = set(self.culture_design.fixed_setpoints)
+        if not optimised:
+            raise ValueError("a culture campaign must optimise at least one variable")
+        if optimised & fixed:
+            raise ValueError(f"variables are both optimised and fixed: {sorted(optimised & fixed)}")
+        for name in optimised | fixed:
+            if not _VARIABLE_NAME.match(name):
+                raise ValueError(f"{name!r} is not a valid controlled-variable name")
+            unit = KNOWN_VARIABLE_UNITS.get(name)
+            if unit is None:
+                continue
             # Fails for incompatible units (e.g. light given in degC).
-            QuantityValue(value=parameter.minimum, unit=parameter.unit).to(unit)
+            if name in optimised:
+                parameter = self.parameter_space.parameters[name]
+                QuantityValue(value=parameter.minimum, unit=parameter.unit).to(unit)
+            else:
+                self.culture_design.fixed_setpoints[name].to(unit)
         used = {metric.name for metric in self.objective.metrics} | {
             item.metric
             for item in (*self.objective.performance_constraints, *self.objective.success_criteria)

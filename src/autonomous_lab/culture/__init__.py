@@ -24,6 +24,7 @@ from autonomous_lab.culture.controller import (
 )
 from autonomous_lab.culture.evidence import CultureRunEvidence, ReplicateEvidence, RunEvent
 from autonomous_lab.culture.models import (
+    ControlledVariable,
     CultureControllerCapabilities,
     CultureDesign,
     CulturePolicy,
@@ -32,6 +33,7 @@ from autonomous_lab.culture.models import (
     CultureReplicate,
     ExecutableCultureProtocol,
     HoldConditionsCommand,
+    ProtectionLimit,
     SamplePoint,
     TimeSeriesMeasurementPlan,
 )
@@ -61,6 +63,7 @@ from autonomous_lab.culture.validation import CultureValidationResult, CultureVa
 
 __all__ = [
     "CULTURE_CONTROLLER_ENTRY_POINT_GROUP",
+    "ControlledVariable",
     "ControllerError",
     "CultureClock",
     "CultureCompilationError",
@@ -93,6 +96,7 @@ __all__ = [
     "IntegratedCultureSensor",
     "InterruptedRun",
     "JournalKind",
+    "ProtectionLimit",
     "ReplicateEvidence",
     "RunEvent",
     "SafeStateAcknowledgement",

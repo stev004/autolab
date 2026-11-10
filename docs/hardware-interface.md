@@ -69,18 +69,26 @@ changes to campaign execution, QC, analysis, storage, or optimisation.
 ## Setpoint-accepting culture controllers
 
 Stage 6 adds `CultureEnvironmentController` in `autonomous_lab.culture.controller`,
-the first plug-in that changes the physical world. It publishes a hashable manifest
-(reactors, setpoint/light ranges, maximum hold, over-temperature trip). It returns
-an acknowledgement carrying the values it actually applied, reports attested
-telemetry, and implements `enter_safe_state`, which the runner calls on every exit
-path. Adapters re-check their own limits, never retry an ambiguous command, and
-keep local protection working without AutoLab. Installed adapters are discovered
-through the `autonomous_lab.culture_controllers` entry-point group. Factories
-receive `controller_id`, `settings` and `clock`. A controller with an integrated
-OD probe exposes it through `IntegratedCultureSensor`. Telemetry should report
-`active_command_id`, so AutoLab can confirm after a restart that the device is
-still holding the acknowledged command before it resumes. Without it, a resume can
-only end the hold safely. See [culture](culture.md).
+the first plug-in that changes the physical world.
+
+- **Manifest.** It publishes a hashable manifest of reactors, **named controlled
+  variables** (unit, range, resolution, tracked), protection limits, consumption
+  resources and its maximum hold.
+- **Setpoints.** A setpoint command names exactly the device's variables. The device
+  rejects unknown or missing ones, and acknowledges with the values it actually
+  applied.
+- **Telemetry.** It reports applied, measured and consumption maps, plus
+  `active_command_id` (the command it is holding). AutoLab can then confirm after a
+  restart that the device is still holding the acknowledged command before it
+  resumes; without that, a resume can only end the hold safely.
+- **Safe state.** The runner requests `enter_safe_state` on every exit path. For a
+  photobioreactor that means heater off, lights off and the CO2 valve closed.
+
+Adapters re-check their own limits, never retry an ambiguous command, and keep local
+protection working without AutoLab. Installed adapters are discovered through the
+`autonomous_lab.culture_controllers` entry-point group. Factories receive
+`controller_id`, `settings` and `clock`. A controller with an integrated OD probe
+exposes it through `IntegratedCultureSensor`. See [culture](culture.md).
 
 ## Future actuation
 

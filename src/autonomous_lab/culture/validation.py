@@ -19,14 +19,13 @@ from typing import Any
 
 from autonomous_lab.culture.compiler import CultureCompilationError, CultureProtocolCompiler
 from autonomous_lab.culture.models import (
-    LIGHT_UNIT,
-    TEMPERATURE_UNIT,
     CultureControllerCapabilities,
     CultureDesign,
     CulturePolicy,
     CultureProtocol,
     CultureReplicate,
     ExecutableCultureProtocol,
+    interval_unit,
     seconds,
 )
 from autonomous_lab.domain.enums import IssueSeverity, ValidationStatus
@@ -206,7 +205,9 @@ def _unique(issues: list[ValidationIssue]) -> list[ValidationIssue]:
     result: list[ValidationIssue] = []
     for issue in issues:
         condition_level = issue.code != "unknown_reactor"
-        key = issue.code if condition_level else f"{issue.code}:{issue.path}"
+        # Strip the "replicates[i]." prefix so one problem per variable is reported.
+        variable_path = issue.path.split("].", 1)[-1]
+        key = f"{issue.code}:{variable_path}" if condition_level else f"{issue.code}:{issue.path}"
         if key not in seen:
             seen.add(key)
             result.append(issue)
@@ -216,24 +217,23 @@ def _unique(issues: list[ValidationIssue]) -> list[ValidationIssue]:
 def _policy_for(replicate: CultureReplicate, policy: CulturePolicy) -> list[ValidationIssue]:
     rule = "culture_policy"
     hold = replicate.hold
-    issues = [
-        *_range_issues(
-            hold.temperature_setpoint,
-            policy.temperature_setpoint_range,
-            TEMPERATURE_UNIT,
-            code="setpoint_outside_policy",
-            path="hold.temperature_setpoint",
-            rule=rule,
-        ),
-        *_range_issues(
-            hold.light_intensity,
-            policy.light_intensity_range,
-            LIGHT_UNIT,
-            code="light_outside_policy",
-            path="hold.light_intensity",
-            rule=rule,
-        ),
-    ]
+    issues: list[ValidationIssue] = []
+    for name, value in hold.setpoints.items():
+        path = f"hold.setpoints.{name}"
+        limit = policy.setpoint_limits.get(name)
+        if limit is None:
+            issues.append(
+                _error(
+                    "setpoint_not_allowed_by_policy",
+                    path,
+                    rule,
+                    f"the installation policy does not allow setting {name!r}",
+                )
+            )
+            continue
+        issues += _range_issues(
+            value, limit, limit.minimum.unit, code="setpoint_outside_policy", path=path, rule=rule
+        )
     if seconds(hold.duration) > seconds(policy.maximum_duration):
         issues.append(
             _error("duration_exceeds_policy", "hold.duration", rule, "hold is longer than allowed")
@@ -286,37 +286,60 @@ def _capability_for(
         issues.append(
             _error("unknown_reactor", "hold.reactor_id", rule, f"no reactor {hold.reactor_id!r}")
         )
-    issues += _range_issues(
-        hold.temperature_setpoint,
-        capabilities.temperature_setpoint_range,
-        TEMPERATURE_UNIT,
-        code="setpoint_outside_device_range",
-        path="hold.temperature_setpoint",
-        rule=rule,
-    )
-    issues += _range_issues(
-        hold.light_intensity,
-        capabilities.light_intensity_range,
-        LIGHT_UNIT,
-        code="light_outside_device_range",
-        path="hold.light_intensity",
-        rule=rule,
-    )
+    declared = set(capabilities.controlled_variables)
+    requested = set(hold.setpoints)
+    if declared != requested:
+        # Exact key set: the device has nothing to hold a missing variable at.
+        issues.append(
+            _error(
+                "setpoints_do_not_match_device",
+                "hold.setpoints",
+                rule,
+                "setpoints must name exactly the device's controlled variables",
+                missing=sorted(declared - requested),
+                unknown=sorted(requested - declared),
+            )
+        )
+    for name, value in hold.setpoints.items():
+        variable = capabilities.controlled_variables.get(name)
+        if variable is None:
+            continue
+        path = f"hold.setpoints.{name}"
+        issues += _range_issues(
+            value,
+            variable.range,
+            variable.unit,
+            code="setpoint_outside_device_range",
+            path=path,
+            rule=rule,
+        )
+        limit = capabilities.protection_limits.get(name)
+        if limit is None:
+            continue
+        unit = variable.unit
+        margin_quantity = policy.minimum_protection_margins.get(name)
+        margin = (
+            Decimal(0) if margin_quantity is None else margin_quantity.to(interval_unit(unit)).value
+        )
+        magnitude = value.to(unit).value
+        too_low = limit.minimum is not None and magnitude - limit.minimum.to(unit).value < margin
+        too_high = limit.maximum is not None and limit.maximum.to(unit).value - magnitude < margin
+        if too_low or too_high:
+            issues.append(
+                _error(
+                    "setpoint_too_close_to_protection_limit",
+                    path,
+                    rule,
+                    f"{name} setpoint must stay {margin} {interval_unit(unit)} inside the "
+                    "device's protection limits",
+                    value=str(magnitude),
+                    minimum=None if limit.minimum is None else str(limit.minimum.to(unit).value),
+                    maximum=None if limit.maximum is None else str(limit.maximum.to(unit).value),
+                )
+            )
     if seconds(hold.duration) > seconds(capabilities.maximum_hold_duration):
         issues.append(
             _error("duration_exceeds_device", "hold.duration", rule, "device cannot hold that long")
-        )
-    setpoint = hold.temperature_setpoint.to(TEMPERATURE_UNIT).value
-    trip = capabilities.over_temperature_trip.to(TEMPERATURE_UNIT).value
-    margin = policy.minimum_trip_margin.to("delta_degree_Celsius").value
-    if trip - setpoint < margin:
-        issues.append(
-            _error(
-                "setpoint_too_close_to_trip",
-                "hold.temperature_setpoint",
-                rule,
-                f"setpoint must stay {margin} degC below the {trip} degC protection trip",
-            )
         )
     return issues
 
@@ -331,7 +354,7 @@ def _range_issues(
     rule: str,
 ) -> list[ValidationIssue]:
     # Resolution is an interval: temperature steps are delta_degree_Celsius.
-    step_unit = "delta_degree_Celsius" if unit == TEMPERATURE_UNIT else unit
+    step_unit = interval_unit(unit)
     magnitude = value.to(unit).value
     minimum = allowed.minimum.to(unit).value
     maximum = allowed.maximum.to(unit).value
@@ -353,7 +376,7 @@ def _range_issues(
         if (magnitude - minimum) % step != 0:
             issues.append(
                 _error(
-                    f"{code.split('_outside')[0]}_off_resolution",
+                    "setpoint_off_resolution",
                     path,
                     rule,
                     f"{magnitude} is not a multiple of {step} from {minimum}",

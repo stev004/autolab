@@ -12,25 +12,25 @@ from __future__ import annotations
 
 import itertools
 import math
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
 from pydantic import Field
 
-from autonomous_lab.culture.controller import EnvironmentTelemetry
 from autonomous_lab.culture.evidence import CultureRunEvidence, ReplicateEvidence
 from autonomous_lab.culture.models import (
-    LIGHT_UNIT,
-    TEMPERATURE_UNIT,
     CultureQCConfig,
+    interval_unit,
     seconds,
     to_timedelta,
 )
 from autonomous_lab.culture.timeseries import TimeSeriesReconciliation
 from autonomous_lab.domain.base import DomainModel
+from autonomous_lab.domain.quantities import QuantityValue
 from autonomous_lab.hardware.sensors.calibration import CalibrationStatus
 
-QC_VERSION = "culture_integrity_qc@2"
+QC_VERSION = "culture_integrity_qc@3"
 
 
 class CultureQCCheck(DomainModel):
@@ -100,12 +100,13 @@ def evaluate_replicate_qc(
     reconciliation: TimeSeriesReconciliation,
     config: CultureQCConfig,
 ) -> CultureQCReport:
+    tracked = run.controller_capabilities.tracked_variables
     checks = (
         _setpoint_acknowledged(replicate),
         _hold_continuous(replicate),
         _no_protection_trip(replicate),
-        _telemetry_coverage(run, replicate, config),
-        _temperature_control(run, replicate, config),
+        *(_telemetry_coverage(run, replicate, config, name) for name in tracked),
+        *(_setpoint_tracking(run, replicate, config, name) for name in tracked),
         _readings_complete(reconciliation, config),
         _no_unexpected_readings(reconciliation),
         _no_saturation(run, reconciliation),
@@ -126,25 +127,36 @@ def _check(code: str, passed: bool, ok: str, failed: str, **details: Any) -> Cul
     )
 
 
+def _same(left: QuantityValue, right: QuantityValue) -> bool:
+    try:
+        return left.to(right.unit).value == right.value
+    except ValueError:
+        return False
+
+
 def _setpoint_acknowledged(evidence: ReplicateEvidence) -> CultureQCCheck:
+    """Every requested variable was applied exactly, and nothing else was."""
+
     ack = evidence.acknowledgement
-    command = evidence.setpoint_command
-    applied_matches = (
+    requested = evidence.setpoint_command.setpoints
+    applied = {} if ack is None or ack.applied is None else ack.applied
+    mismatched = sorted(
+        name
+        for name in set(requested) | set(applied)
+        if name not in requested or name not in applied or not _same(applied[name], requested[name])
+    )
+    passed = (
         ack is not None
         and ack.accepted
-        and ack.command_id == command.command_id
-        and ack.applied_temperature_setpoint is not None
-        and ack.applied_light_intensity is not None
-        and ack.applied_temperature_setpoint.to(TEMPERATURE_UNIT).value
-        == command.temperature_setpoint.to(TEMPERATURE_UNIT).value
-        and ack.applied_light_intensity.to(LIGHT_UNIT).value
-        == command.light_intensity.to(LIGHT_UNIT).value
+        and ack.command_id == evidence.setpoint_command.command_id
+        and not mismatched
     )
     return _check(
         "setpoint_acknowledged",
-        applied_matches,
+        passed,
         "device applied exactly the requested setpoints",
         "device did not acknowledge applying the requested setpoints",
+        mismatched=mismatched,
         acknowledgement=None if ack is None else ack.model_dump(mode="json"),
     )
 
@@ -155,20 +167,27 @@ def _no_protection_trip(evidence: ReplicateEvidence) -> CultureQCCheck:
         for sample in evidence.telemetry
         if sample.protection_tripped or sample.trip_count > 0
     ]
+    faults = sorted(
+        {
+            fault
+            for sample in evidence.telemetry
+            if sample.protection_tripped
+            for fault in sample.faults
+            if fault.endswith("_trip")
+        }
+    )
     return _check(
         "no_protection_trip",
         not tripped,
         "device protection never tripped",
         "device protection tripped during the hold",
         tripped_at=tripped,
+        trips=faults,
     )
 
 
-def _post_warmup(
-    run: CultureRunEvidence, evidence: ReplicateEvidence, config: CultureQCConfig
-) -> list[EnvironmentTelemetry]:
-    settled = run.hold_started_at + to_timedelta(config.warmup)
-    return [sample for sample in evidence.telemetry if sample.sampled_at >= settled]
+def _settled(run: CultureRunEvidence, config: CultureQCConfig, variable: str) -> datetime:
+    return run.hold_started_at + to_timedelta(config.warmup_for(variable))
 
 
 def _hold_continuous(evidence: ReplicateEvidence) -> CultureQCCheck:
@@ -181,49 +200,65 @@ def _hold_continuous(evidence: ReplicateEvidence) -> CultureQCCheck:
 
 
 def _telemetry_coverage(
-    run: CultureRunEvidence, evidence: ReplicateEvidence, config: CultureQCConfig
+    run: CultureRunEvidence,
+    evidence: ReplicateEvidence,
+    config: CultureQCConfig,
+    variable: str,
 ) -> CultureQCCheck:
     """Coverage against the *expected* sample count, so outages count as gaps."""
 
-    window = _post_warmup(run, evidence, config)
-    settled = run.hold_started_at + to_timedelta(config.warmup)
+    settled = _settled(run, config, variable)
+    window = [sample for sample in evidence.telemetry if sample.sampled_at >= settled]
     span = (run.ended_at - settled).total_seconds()
     interval = float(seconds(run.receipt.protocol.telemetry_interval))
     expected = max(int(span // interval) + 1, 1) if span > 0 else 1
-    with_value = [sample for sample in window if sample.measured_temperature is not None]
+    with_value = [sample for sample in window if sample.measured.get(variable) is not None]
     coverage = min(Decimal(len(with_value)) / Decimal(expected), Decimal(1))
     return _check(
-        "telemetry_coverage",
+        f"telemetry_coverage:{variable}",
         coverage >= config.minimum_telemetry_coverage,
-        "enough temperature telemetry after warm-up",
-        "too many missing temperature readings after warm-up",
+        f"enough measured {variable} after warm-up",
+        f"too many missing {variable} readings after warm-up",
         coverage=str(coverage),
         samples=len(window),
         expected_samples=expected,
     )
 
 
-def _temperature_control(
-    run: CultureRunEvidence, evidence: ReplicateEvidence, config: CultureQCConfig
+def _setpoint_tracking(
+    run: CultureRunEvidence,
+    evidence: ReplicateEvidence,
+    config: CultureQCConfig,
+    variable: str,
 ) -> CultureQCCheck:
-    setpoint = evidence.setpoint_command.temperature_setpoint.to(TEMPERATURE_UNIT).value
+    """Mean |measured - setpoint| after this variable's warm-up, within tolerance."""
+
+    code = f"control:{variable}"
+    target = evidence.setpoint_command.setpoints.get(variable)
+    tolerance = config.tracking_tolerances.get(variable)
+    if target is None:
+        return _check(code, False, "", f"no setpoint was commanded for tracked {variable}")
+    if tolerance is None:
+        return _check(code, False, "", f"no tracking tolerance configured for {variable}")
+    settled = _settled(run, config, variable)
     values = [
-        sample.measured_temperature.to(TEMPERATURE_UNIT).value
-        for sample in _post_warmup(run, evidence, config)
-        if sample.measured_temperature is not None
+        measured.to(target.unit).value
+        for sample in evidence.telemetry
+        if sample.sampled_at >= settled
+        for measured in (sample.measured.get(variable),)
+        if measured is not None
     ]
     if not values:
-        return _check(
-            "temperature_control", False, "", "no post-warm-up temperature telemetry to check"
-        )
-    deviation = sum((abs(value - setpoint) for value in values), Decimal(0)) / len(values)
+        return _check(code, False, "", f"no post-warm-up {variable} telemetry to check")
+    deviation = sum((abs(value - target.value) for value in values), Decimal(0)) / len(values)
     return _check(
-        "temperature_control",
-        deviation <= config.maximum_mean_temperature_deviation,
-        "measured temperature tracked the setpoint",
-        "measured temperature drifted from the setpoint",
+        code,
+        deviation <= tolerance,
+        f"measured {variable} tracked the setpoint",
+        f"measured {variable} drifted from the setpoint",
         mean_absolute_deviation=str(deviation),
-        limit=str(config.maximum_mean_temperature_deviation),
+        limit=str(tolerance),
+        unit=interval_unit(target.unit),
     )
 
 

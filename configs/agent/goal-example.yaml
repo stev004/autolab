@@ -9,4 +9,4 @@ objectives:
   - {metric: final_od750, direction: maximize}
   - {metric: energy_kwh, direction: minimize}
 parameter_focus:
-  temperature_setpoint: [24, 31]
+  temperature: [24, 31]

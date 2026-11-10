@@ -139,6 +139,8 @@ class DispatchHeader(DomainModel):
     run_id: UUID
     experiment_id: UUID
     receipt: ExecutableCultureProtocol
+    #: The manifest the receipt was validated against (its hash is in the receipt).
+    controller_capabilities: CultureControllerCapabilities
     sensor_capabilities: SensorCapabilities
     #: One planned command per replicate, in replicate order.
     commands: tuple[SetpointCommand, ...]
@@ -341,6 +343,7 @@ class CultureExperimentRunner:
             run_id=uuid5(NAMESPACE_URL, f"autolab:culture-run:{protocol.experiment_id}"),
             experiment_id=protocol.experiment_id,
             receipt=receipt,
+            controller_capabilities=capabilities,
             sensor_capabilities=sensor_capabilities,
             commands=(),
         )
@@ -775,8 +778,7 @@ class CultureExperimentRunner:
             experiment_id=receipt.protocol.experiment_id,
             run_id=run_id,
             reactor_id=spec.hold.reactor_id,
-            temperature_setpoint=spec.hold.temperature_setpoint,
-            light_intensity=spec.hold.light_intensity,
+            setpoints=dict(spec.hold.setpoints),
             protocol_hash=receipt.protocol_hash,
             issued_at=self.clock.now(),
         )
@@ -826,6 +828,7 @@ class CultureExperimentRunner:
             experiment_id=header.experiment_id,
             receipt=header.receipt,
             controller_capability_sha256=header.receipt.capability_snapshot_hash,
+            controller_capabilities=header.controller_capabilities,
             sensor_capabilities=header.sensor_capabilities,
             hold_started_at=started_at,
             ended_at=self.clock.now(),

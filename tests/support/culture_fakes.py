@@ -14,11 +14,13 @@ from decimal import Decimal
 from uuid import uuid4
 
 from autonomous_lab.culture import (
+    ControlledVariable,
     ControllerError,
     CultureControllerCapabilities,
     CultureDesign,
     CulturePolicy,
     EnvironmentTelemetry,
+    ProtectionLimit,
     SafeStateAcknowledgement,
     SetpointAcknowledgement,
     SetpointCommand,
@@ -46,6 +48,7 @@ from autonomous_lab.hardware.sensors import (
 START = datetime(2026, 11, 1, 8, tzinfo=UTC)
 TEMP = "degree_Celsius"
 LIGHT = "micromole / meter ** 2 / second"
+PH = "dimensionless"
 REACTOR = "reactor-1"
 REACTORS = ("reactor-1", "reactor-2", "reactor-3")
 
@@ -69,13 +72,24 @@ def design(**overrides: object) -> CultureDesign:
 def policy(**overrides: object) -> CulturePolicy:
     values: dict[str, object] = {
         "policy_name": "test-culture-policy",
-        "policy_version": "1",
-        "temperature_setpoint_range": QuantityRange(
-            minimum=q(18, TEMP), maximum=q(36, TEMP), resolution=q("0.1", "delta_degree_Celsius")
-        ),
-        "light_intensity_range": QuantityRange(
-            minimum=q(0, LIGHT), maximum=q(500, LIGHT), resolution=q(1, LIGHT)
-        ),
+        "policy_version": "2",
+        "setpoint_limits": {
+            "temperature": QuantityRange(
+                minimum=q(18, TEMP),
+                maximum=q(36, TEMP),
+                resolution=q("0.1", "delta_degree_Celsius"),
+            ),
+            "light_intensity": QuantityRange(
+                minimum=q(0, LIGHT), maximum=q(500, LIGHT), resolution=q(1, LIGHT)
+            ),
+            "ph": QuantityRange(
+                minimum=q("6.0", PH), maximum=q("9.0", PH), resolution=q("0.05", PH)
+            ),
+        },
+        "minimum_protection_margins": {
+            "temperature": q(2, "delta_degree_Celsius"),
+            "ph": q("0.3", PH),
+        },
         "maximum_duration": q(72, "hour"),
         "minimum_sampling_interval": q(30, "minute"),
         "maximum_sample_points": 200,
@@ -84,17 +98,46 @@ def policy(**overrides: object) -> CulturePolicy:
     return CulturePolicy.model_validate(values, strict=False)
 
 
-def capabilities(**overrides: object) -> CultureControllerCapabilities:
+def variables(
+    *, ph: bool = False, temperature_range: tuple[int, int] = (15, 40)
+) -> dict[str, object]:
+    declared: dict[str, object] = {
+        "temperature": ControlledVariable(
+            unit=TEMP,
+            range=QuantityRange(
+                minimum=q(temperature_range[0], TEMP), maximum=q(temperature_range[1], TEMP)
+            ),
+            tracked=True,
+        ),
+        "light_intensity": ControlledVariable(
+            unit=LIGHT, range=QuantityRange(minimum=q(0, LIGHT), maximum=q(600, LIGHT))
+        ),
+    }
+    if ph:
+        declared["ph"] = ControlledVariable(
+            unit=PH,
+            range=QuantityRange(
+                minimum=q("6.0", PH), maximum=q("9.0", PH), resolution=q("0.05", PH)
+            ),
+            tracked=True,
+        )
+    return declared
+
+
+def capabilities(*, ph: bool = False, **overrides: object) -> CultureControllerCapabilities:
+    limits: dict[str, object] = {"temperature": ProtectionLimit(maximum=q(42, TEMP))}
+    if ph:
+        limits["ph"] = ProtectionLimit(minimum=q("5.5", PH), maximum=q("9.8", PH))
     values: dict[str, object] = {
         "controller_id": "ctrl-1",
         "device_type": "photobioreactor_environment",
         "adapter_name": "scripted-test-controller",
         "adapter_version": "0.0.1",
         "reactor_ids": frozenset(REACTORS),
-        "temperature_setpoint_range": QuantityRange(minimum=q(15, TEMP), maximum=q(40, TEMP)),
-        "light_intensity_range": QuantityRange(minimum=q(0, LIGHT), maximum=q(600, LIGHT)),
+        "controlled_variables": variables(ph=ph),
+        "protection_limits": limits,
+        "resources": frozenset({"energy", "co2"} if ph else {"energy"}),
         "maximum_hold_duration": q(96, "hour"),
-        "over_temperature_trip": q(42, TEMP),
         "is_simulated": True,
     }
     values.update(overrides)
@@ -108,7 +151,7 @@ def proposal(
         campaign_id=uuid4(),
         suggestion_index=0,
         parameter_values={
-            "temperature_setpoint": q(temperature, TEMP),
+            "temperature": q(temperature, TEMP),
             "light_intensity": q(light, LIGHT),
             **extra,
         },
@@ -130,9 +173,12 @@ class ScriptedController:
     manifest: CultureControllerCapabilities = field(default_factory=capabilities)
     #: measured - setpoint, as a function of elapsed hours; None = probe dropout.
     temperature_error: Callable[[Decimal], Decimal | None] = lambda _h: Decimal("0.1")
+    #: measured pH - setpoint pH (only used when the device controls ph).
+    ph_error: Callable[[Decimal], Decimal | None] = lambda _h: Decimal("0.02")
     trip_after_hours: Decimal | None = None
     applied_temperature_override: QuantityValue | None = None
     power_kw: Decimal = Decimal("0.05")
+    co2_g_per_hour: Decimal = Decimal("0.5")
     setpoint_failure: ControllerError | None = None
     #: Adapter-side hard limit, checked even if upstream validation passed.
     internal_maximum_temperature: Decimal | None = None
@@ -158,59 +204,81 @@ class ScriptedController:
     async def capability_manifest(self) -> CultureControllerCapabilities:
         return self.manifest
 
+    def _reject(self, command: SetpointCommand, code: str) -> SetpointAcknowledgement:
+        return SetpointAcknowledgement(
+            command_id=command.command_id,
+            controller_id=self.controller_id,
+            reactor_id=command.reactor_id,
+            accepted=False,
+            rejection_code=code,
+            acknowledged_at=self.clock.now(),
+        )
+
     async def apply_setpoints(self, command: SetpointCommand) -> SetpointAcknowledgement:
         self.commands.append(command)
         if self.setpoint_failure is not None:
             raise self.setpoint_failure
-        temperature = command.temperature_setpoint.to(TEMP).value
-        limits = self.manifest.temperature_setpoint_range
+        # Exact key set: unknown or missing variables are refused.
+        if set(command.setpoints) != set(self.manifest.controlled_variables):
+            return self._reject(command, "setpoints_do_not_match_device")
+        for name, value in command.setpoints.items():
+            variable = self.manifest.controlled_variables[name]
+            magnitude = value.to(variable.unit).value
+            if not (
+                variable.range.minimum.to(variable.unit).value
+                <= magnitude
+                <= variable.range.maximum.to(variable.unit).value
+            ):
+                return self._reject(command, "setpoint_out_of_device_range")
         ceiling = self.internal_maximum_temperature
-        if not limits.minimum.value <= temperature <= limits.maximum.value or (
-            ceiling is not None and temperature > ceiling
-        ):
-            return SetpointAcknowledgement(
-                command_id=command.command_id,
-                controller_id=self.controller_id,
-                reactor_id=command.reactor_id,
-                accepted=False,
-                rejection_code="setpoint_out_of_device_range",
-                acknowledged_at=self.clock.now(),
-            )
+        if ceiling is not None and command.setpoints["temperature"].to(TEMP).value > ceiling:
+            return self._reject(command, "setpoint_out_of_device_range")
         self.applied[command.reactor_id] = command
         self.started[command.reactor_id] = self.clock.now()
+        applied = dict(command.setpoints)
+        if self.applied_temperature_override is not None:
+            applied["temperature"] = self.applied_temperature_override
         return SetpointAcknowledgement(
             command_id=command.command_id,
             controller_id=self.controller_id,
             reactor_id=command.reactor_id,
             accepted=True,
-            applied_temperature_setpoint=self.applied_temperature_override
-            or command.temperature_setpoint,
-            applied_light_intensity=command.light_intensity,
+            applied=applied,
             acknowledged_at=self.clock.now(),
         )
 
     async def read_telemetry(self, reactor_id: str) -> EnvironmentTelemetry:
         if self.telemetry_failure is not None:
             raise self.telemetry_failure
-        applied = self.applied[reactor_id]
+        command = self.applied[reactor_id]
         elapsed = Decimal(str((self.clock.now() - self.started[reactor_id]).total_seconds())) / 3600
         tripped = self.trip_after_hours is not None and elapsed >= self.trip_after_hours
+        measured: dict[str, QuantityValue | None] = {}
         error = self.temperature_error(elapsed)
         if error is not None:
             error += self.reactor_error.get(reactor_id, Decimal(0))
-        setpoint = applied.temperature_setpoint.to(TEMP).value
+        setpoint = command.setpoints["temperature"].to(TEMP).value
+        measured["temperature"] = None if error is None else q(str(setpoint + error), TEMP)
+        consumption = {"energy": q(str(self.power_kw * elapsed), "kilowatt_hour")}
+        if "ph" in command.setpoints:
+            ph_error = self.ph_error(elapsed)
+            ph = command.setpoints["ph"].to(PH).value
+            measured["ph"] = None if ph_error is None else q(str(ph + ph_error), PH)
+            consumption["co2"] = q(str(self.co2_g_per_hour * elapsed), "gram")
+        faults = self.reactor_faults.get(reactor_id, ())
+        if tripped:
+            faults = (*faults, "over_temperature_trip")
         return EnvironmentTelemetry(
             controller_id=self.controller_id,
             reactor_id=reactor_id,
             sampled_at=self.clock.now(),
-            measured_temperature=None if error is None else q(str(setpoint + error), TEMP),
-            applied_temperature_setpoint=applied.temperature_setpoint,
-            applied_light_intensity=applied.light_intensity,
+            applied=dict(command.setpoints),
+            measured=measured,
+            consumption=consumption,
             protection_tripped=tripped,
             trip_count=1 if tripped else 0,
-            cumulative_energy=q(str(self.power_kw * elapsed), "kilowatt_hour"),
-            faults=self.reactor_faults.get(reactor_id, ()),
-            active_command_id=None if self.forget_commands else applied.command_id,
+            faults=faults,
+            active_command_id=None if self.forget_commands else command.command_id,
         )
 
     async def enter_safe_state(self, reactor_id: str, reason: str) -> SafeStateAcknowledgement:

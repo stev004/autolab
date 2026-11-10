@@ -3,13 +3,14 @@
 from datetime import timedelta
 
 import pytest
-from culture_fakes import LIGHT, START, TEMP, capabilities, design, policy, proposal, q
+from culture_fakes import LIGHT, START, TEMP, capabilities, design, policy, proposal, q, variables
 from culture_fakes import capabilities as make_capabilities
 from culture_fakes import design as make_design
 from culture_fakes import policy as make_policy
 from culture_fakes import proposal as make_proposal
 
 from autonomous_lab.culture import (
+    ControlledVariable,
     CultureCompilationError,
     CultureControllerCapabilities,
     CultureDesign,
@@ -18,9 +19,11 @@ from autonomous_lab.culture import (
     CultureProtocolCompiler,
     CultureValidationResult,
     CultureValidationService,
+    ProtectionLimit,
 )
 from autonomous_lab.domain.enums import ValidationStatus
 from autonomous_lab.domain.experiments import ExperimentProposal
+from autonomous_lab.domain.protocols import QuantityRange
 
 
 def _validate(
@@ -71,9 +74,23 @@ def test_compilation_is_deterministic_in_its_scientific_content() -> None:
     assert first.protocol_hash == first.compute_hash()
 
 
-def test_proposal_must_contain_exactly_the_culture_parameters() -> None:
-    with pytest.raises(CultureCompilationError):
-        CultureProtocolCompiler().compile(proposal(pH=q("7", "dimensionless")), design())
+def test_setpoints_must_name_exactly_the_device_variables() -> None:
+    # An extra variable the device does not control is refused before dispatch...
+    extra = _validate(proposal=proposal(stirring=q("100", "1 / minute")))
+    assert "setpoints_do_not_match_device" in _codes(extra)
+    # ...and so is a missing one: the device would have nothing to hold it at.
+    missing = _validate(capabilities=capabilities(ph=True))
+    assert "setpoints_do_not_match_device" in _codes(missing)
+    # Fixing the missing variable in the design satisfies the device.
+    fixed = design(fixed_setpoints={"ph": q("7.5", "dimensionless")})
+    assert _validate(design=fixed, capabilities=capabilities(ph=True)).executable is not None
+
+
+def test_a_variable_cannot_be_both_optimised_and_fixed() -> None:
+    with pytest.raises(CultureCompilationError, match="both optimised and fixed"):
+        CultureProtocolCompiler().compile(
+            proposal(), design(fixed_setpoints={"temperature": q(30, TEMP)})
+        )
 
 
 def test_overlapping_sample_windows_are_rejected_by_the_design() -> None:
@@ -104,7 +121,7 @@ def test_valid_protocol_receives_a_hash_bound_receipt() -> None:
     [
         (proposal(temperature="37"), "setpoint_outside_policy"),
         (proposal(temperature="30.05"), "setpoint_off_resolution"),
-        (proposal(light="550"), "light_outside_policy"),
+        (proposal(light="550"), "setpoint_outside_policy"),
     ],
 )
 def test_policy_limits_reject_unsafe_conditions(prop: ExperimentProposal, expected: str) -> None:
@@ -114,22 +131,37 @@ def test_policy_limits_reject_unsafe_conditions(prop: ExperimentProposal, expect
 
 
 def test_device_limits_apply_even_inside_policy() -> None:
-    narrow = capabilities(
-        temperature_setpoint_range={"minimum": q(20, TEMP), "maximum": q(28, TEMP)},
-        light_intensity_range={"minimum": q(0, LIGHT), "maximum": q(150, LIGHT)},
-        maximum_hold_duration=q(12, "hour"),
+    declared = variables()
+    declared["temperature"] = ControlledVariable(
+        unit=TEMP, range=QuantityRange(minimum=q(20, TEMP), maximum=q(28, TEMP)), tracked=True
     )
-    codes = _codes(_validate(capabilities=narrow))
-    assert {
-        "setpoint_outside_device_range",
-        "light_outside_device_range",
-        "duration_exceeds_device",
-    } <= codes
+    declared["light_intensity"] = ControlledVariable(
+        unit=LIGHT, range=QuantityRange(minimum=q(0, LIGHT), maximum=q(150, LIGHT))
+    )
+    narrow = capabilities(controlled_variables=declared, maximum_hold_duration=q(12, "hour"))
+    result = _validate(capabilities=narrow)
+    out_of_range = {
+        issue.path
+        for issue in result.report.issues
+        if issue.code == "setpoint_outside_device_range"
+    }
+    assert out_of_range == {
+        "replicates[0].hold.setpoints.temperature",
+        "replicates[0].hold.setpoints.light_intensity",
+    }
+    assert "duration_exceeds_device" in _codes(result)
 
 
 def test_setpoint_must_keep_a_margin_below_the_device_trip() -> None:
-    codes = _codes(_validate(capabilities=capabilities(over_temperature_trip=q(31, TEMP))))
-    assert "setpoint_too_close_to_trip" in codes
+    tight = capabilities(protection_limits={"temperature": ProtectionLimit(maximum=q(31, TEMP))})
+    assert "setpoint_too_close_to_protection_limit" in _codes(_validate(capabilities=tight))
+    # pH has limits on both sides: 6.0 sits 0.5 above the 5.5 trip (clear of the 0.3
+    # margin), but 5.7 is only 0.2 above it.
+    ph_design = design(fixed_setpoints={"ph": q("6.0", "dimensionless")})
+    assert _validate(design=ph_design, capabilities=capabilities(ph=True)).executable is not None
+    low = design(fixed_setpoints={"ph": q("5.7", "dimensionless")})
+    codes = _codes(_validate(design=low, capabilities=capabilities(ph=True)))
+    assert {"setpoint_too_close_to_protection_limit", "setpoint_outside_policy"} <= codes
 
 
 def test_unknown_reactor_is_rejected() -> None:
@@ -155,7 +187,11 @@ def test_tampered_protocol_is_rejected_even_with_a_recomputed_hash() -> None:
     protocol = CultureProtocolCompiler().compile(prop, des)
     first = protocol.replicates[0]
     hotter = first.model_copy(
-        update={"hold": first.hold.model_copy(update={"temperature_setpoint": q(35, TEMP)})}
+        update={
+            "hold": first.hold.model_copy(
+                update={"setpoints": {**first.hold.setpoints, "temperature": q(35, TEMP)}}
+            )
+        }
     )
     tampered = protocol.model_copy(update={"replicates": (hotter,)})
     tampered = tampered.model_copy(update={"protocol_hash": tampered.compute_hash()})

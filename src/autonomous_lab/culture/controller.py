@@ -34,15 +34,18 @@ CULTURE_CONTROLLER_ENTRY_POINT_GROUP = "autonomous_lab.culture_controllers"
 
 
 class SetpointCommand(DomainModel):
-    """One bounded request to change a reactor's environment."""
+    """One bounded request to change a reactor's environment.
 
-    schema_version: Literal["1"] = "1"
+    ``setpoints`` names *exactly* the device's controlled variables: the device
+    rejects unknown and missing ones, since it has nothing to hold a missing one at.
+    """
+
+    schema_version: Literal["2"] = "2"
     command_id: UUID = Field(default_factory=new_uuid)
     experiment_id: UUID
     run_id: UUID
     reactor_id: str = Field(min_length=1)
-    temperature_setpoint: QuantityValue
-    light_intensity: QuantityValue
+    setpoints: dict[str, QuantityValue]
     protocol_hash: str
     issued_at: datetime = Field(default_factory=utc_now)
 
@@ -53,15 +56,14 @@ class SetpointCommand(DomainModel):
 
 
 class SetpointAcknowledgement(DomainModel):
-    """What the device says it did. ``applied_*`` may differ from what was asked."""
+    """What the device says it did. ``applied`` may differ from what was asked."""
 
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["2"] = "2"
     command_id: UUID
     controller_id: str
     reactor_id: str
     accepted: bool
-    applied_temperature_setpoint: QuantityValue | None = None
-    applied_light_intensity: QuantityValue | None = None
+    applied: dict[str, QuantityValue] | None = None
     rejection_code: str | None = None
     rejection_message: str | None = None
     acknowledged_at: datetime
@@ -73,8 +75,7 @@ class SetpointAcknowledgement(DomainModel):
 
     @model_validator(mode="after")
     def _consistent(self) -> SetpointAcknowledgement:
-        applied = (self.applied_temperature_setpoint, self.applied_light_intensity)
-        if self.accepted and None in applied:
+        if self.accepted and not self.applied:
             raise ValueError("an accepted setpoint must report the applied values")
         if not self.accepted and self.rejection_code is None:
             raise ValueError("a rejected setpoint must give a rejection code")
@@ -84,16 +85,19 @@ class SetpointAcknowledgement(DomainModel):
 class EnvironmentTelemetry(DomainModel):
     """One device-attested telemetry sample. ``None`` means the probe gave no value."""
 
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["2"] = "2"
     controller_id: str
     reactor_id: str
     sampled_at: datetime
-    measured_temperature: QuantityValue | None
-    applied_temperature_setpoint: QuantityValue
-    applied_light_intensity: QuantityValue
+    #: The setpoints the device is applying right now.
+    applied: dict[str, QuantityValue]
+    #: One key per *tracked* variable; ``None`` is a probe dropout.
+    measured: dict[str, QuantityValue | None] = Field(default_factory=dict)
+    #: Cumulative resource use since the command was applied, e.g. energy, co2.
+    consumption: dict[str, QuantityValue] = Field(default_factory=dict)
     protection_tripped: bool = False
     trip_count: int = Field(default=0, ge=0)
-    cumulative_energy: QuantityValue
+    #: Device fault codes, including which limit tripped (e.g. ``ph_low_trip``).
     faults: tuple[str, ...] = ()
     #: The setpoint command the device is currently holding, if it tracks one.
     #: Needed to resume a hold after AutoLab restarts; without it, resume can only

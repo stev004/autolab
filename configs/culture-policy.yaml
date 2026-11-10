@@ -1,20 +1,30 @@
-# Trusted installation policy for culture experiments (stage 6).
-# Campaign documents cannot widen these limits. Values are illustrative for a
-# small simulated photobioreactor, not validated for any real organism or device.
-schema_version: "1"
+# Trusted installation policy for culture experiments (stage 6, contract v2).
+# Campaign documents cannot widen these limits. Devices declare their own ranges and
+# protection limits; the effective range for each variable is policy ∩ device.
+# Values are illustrative for a small simulated photobioreactor, not validated for any
+# real organism or device.
+schema_version: "2"
 policy_name: culture_policy_simulated_photobioreactor
-policy_version: "1"
-temperature_setpoint_range:
-  minimum: {value: 18, unit: degree_Celsius}
-  maximum: {value: 36, unit: degree_Celsius}
-  resolution: {value: 0.1, unit: delta_degree_Celsius}
-light_intensity_range:
-  minimum: {value: 0, unit: micromole / meter ** 2 / second}
-  maximum: {value: 500, unit: micromole / meter ** 2 / second}
-  resolution: {value: 1, unit: micromole / meter ** 2 / second}
+policy_version: "2"
+setpoint_limits:
+  temperature:
+    minimum: {value: 18, unit: degree_Celsius}
+    maximum: {value: 36, unit: degree_Celsius}
+    resolution: {value: 0.1, unit: delta_degree_Celsius}
+  light_intensity:
+    minimum: {value: 0, unit: micromole / meter ** 2 / second}
+    maximum: {value: 500, unit: micromole / meter ** 2 / second}
+    resolution: {value: 1, unit: micromole / meter ** 2 / second}
+  ph:
+    minimum: {value: 6.0, unit: dimensionless}
+    maximum: {value: 9.0, unit: dimensionless}
+    resolution: {value: 0.05, unit: dimensionless}
+# Setpoints must stay at least this far inside each device protection limit.
+minimum_protection_margins:
+  temperature: {value: 2, unit: delta_degree_Celsius}
+  ph: {value: 0.3, unit: dimensionless}
 maximum_duration: {value: 72, unit: hour}
 minimum_sampling_interval: {value: 30, unit: minute}
 maximum_sample_points: 200
 maximum_replicates: 8
-minimum_trip_margin: {value: 2, unit: delta_degree_Celsius}
 trusted_compilers: ["culture_hold_compiler@1.0.0"]

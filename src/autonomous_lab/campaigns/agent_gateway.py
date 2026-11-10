@@ -52,12 +52,6 @@ from autonomous_lab.storage.orm import (
 #: An agent may propose changes, but review flags them for explicit human sign-off.
 EXECUTION_SECTIONS = ("execution", "simulation", "culture_design", "assay_design")
 
-# v1 culture parameter names -> the policy range that bounds them.
-_CULTURE_POLICY_RANGES = {
-    "temperature_setpoint": "temperature_setpoint_range",
-    "light_intensity": "light_intensity_range",
-}
-
 
 @dataclass(frozen=True, slots=True)
 class DraftReview:
@@ -275,17 +269,27 @@ def _limitations(config_json: dict[str, Any], experiment_type: str) -> tuple[str
 
 
 def _culture_policy_errors(config: CultureCampaignConfig, policy: CulturePolicy) -> list[str]:
-    """Catch ranges the trusted policy would reject for every experiment, before any run."""
+    """Catch variables or ranges the trusted policy would reject for every experiment.
+
+    The device's own ranges are checked when the campaign runs, against its live
+    manifest; a draft is reviewed without a device.
+    """
 
     errors: list[str] = []
-    for name, field in _CULTURE_POLICY_RANGES.items():
-        parameter = config.parameter_space.parameters.get(name)
-        if parameter is None:
+    optimised = config.parameter_space.parameters
+    fixed = config.culture_design.fixed_setpoints
+    for name in sorted(set(optimised) | set(fixed)):
+        allowed = policy.setpoint_limits.get(name)
+        if allowed is None:
+            errors.append(f"the installation policy does not allow setting {name!r}")
             continue
-        allowed = getattr(policy, field)
         unit = allowed.minimum.unit
-        low = QuantityValue(value=parameter.minimum, unit=parameter.unit).to(unit).value
-        high = QuantityValue(value=parameter.maximum, unit=parameter.unit).to(unit).value
+        if name in optimised:
+            parameter = optimised[name]
+            low = QuantityValue(value=parameter.minimum, unit=parameter.unit).to(unit).value
+            high = QuantityValue(value=parameter.maximum, unit=parameter.unit).to(unit).value
+        else:
+            low = high = fixed[name].to(unit).value
         minimum = allowed.minimum.value
         maximum = allowed.maximum.to(unit).value
         if low < minimum or high > maximum:
