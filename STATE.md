@@ -5,7 +5,7 @@ Updated: 2026-11-11
 ## Stage
 - Done: V0 (simulated assay loop), Stage 2 / v0.5 (human-in-the-loop, sensors, hardening), Stage 6 (biological culture, simulation and contract tests), culture contract v2.
 - Stage 7 (research agents): first slice done. Not started: Stages 3, 4, 5, 8.
-- `main` = `e9f8421` (pushed to GitHub `stev004/autolab`). 341 tests pass locally; ruff and pyright clean. GitHub CI for `e9f8421` was still running at closeout.
+- `main` = `e9f8421` (pushed to GitHub `stev004/autolab`). 341 tests pass locally; ruff and pyright clean. GitHub CI passed on `e9f8421`.
 
 ## Current
 - Culture campaigns (`autolab culture create/run/report/reconcile/flag-contamination`):

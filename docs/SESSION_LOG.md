@@ -46,8 +46,7 @@ algae-sim session, coordinated through the shared notes folder (outside the repo
   against it.
 - **Stage 8 parallel batches.** Owner: an AutoLab session, once algae-sim is on v2.
   Scope is in `STATE.md` → Next 3.
-- **GitHub CI for `e9f8421`.** It was running at closeout, and the previous run on
-  `44e550e` passed. Next action: check with `gh run list --limit 1` in the repo.
+- GitHub CI passed on `e9f8421` (run 42935650970).
 - Merged local branches are still present; delete them when convenient.
 
 **User actions**
