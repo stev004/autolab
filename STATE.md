@@ -18,24 +18,23 @@ Updated: 2026-11-11
 - Thresholds and the simulated biology are illustrative and unvalidated. No real hardware has been driven.
 
 ## Next
-1. **algae-sim migrates to contract v2** (algae-sim's own thread). Pin to `e9f8421`, update `algae_sim/autolab/_convert.py` and device core, then re-run its end-to-end campaign. AutoLab waits on this.
-2. Once algae-sim is on v2: run `configs/culture-algae-sim.yaml` end to end against the real adapter. It optimises temperature, light and pH; objectives are final_od750, energy_kwh and co2_g.
-3. **Stage 8, first slice: parallel reactor batches.**
+1. **Stage 8, first slice: parallel reactor batches.**
    - batch `ask` of several conditions per round, each condition on its own reactor group (replicates within a group);
    - run the batch concurrently, then `tell` every result;
    - per-experiment journal and resume kept.
 
-   Agreed with Steven; not started.
-4. Later stage 7 work: a model-backed agent (local model, or an API if affordable) behind `ResearchAgent`, an MCP server, and literature retrieval.
-5. Housekeeping: delete merged local branches (`stage6-*`, `stage7-agents`, `culture-contract-v2`).
+   Agreed with Steven; not started. algae-sim's reactor bank is the target rig.
+2. Later stage 7 work: a model-backed agent (local model, or an API if affordable) behind `ResearchAgent`, an MCP server, and literature retrieval.
+3. Housekeeping: delete merged local branches (`stage6-*`, `stage7-agents`, `culture-contract-v2`).
 
 ## Blockers
-- Step 2 waits on algae-sim's v2 adapter. Nothing else is blocked.
+- None.
 
 ## Integrations
 - **algae-sim** (`~/Documents/algae-sim`, GitHub-pinned dependency):
   - provides the `algae-sim-reactor` controller (`autonomous_lab.culture_controllers` entry point; integrated OD750 probe; `is_simulated=True`);
-  - currently pinned to AutoLab `44e550e`, which is pre-v2;
+  - on contract v2 since algae-sim `fe01b0c` (local, not pushed yet; Steven decides), pinned to AutoLab `e9f8421`;
+  - per algae-sim's report (2026-11-11; not re-run from AutoLab), `configs/culture-algae-sim.yaml` (20 experiments × 3 reactors; temperature, light, pH; final_od750, energy_kwh, co2_g) runs to completion, and QC failures match its injected faults (control:temperature, growth_plausible, ph_low_trip with control:ph);
   - agreed v2 device facts: temperature 20–36 °C (heating only) with a 39 °C trip; light 0–500; pH 6.0–9.0 at 0.05 with trips at 5.5 and 9.8; resources energy (kWh) and co2 (g); safe state closes the CO2 valve.
 
   Decision record: `docs/adr/0004-culture-controlled-variables.md`.

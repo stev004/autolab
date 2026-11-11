@@ -40,12 +40,12 @@ algae-sim session, coordinated through the shared notes folder (outside the repo
   a "Reference adapter: algae-sim" section in `docs/culture.md`.
 
 **Open threads (resume points)**
-- **algae-sim v2 migration.** Owner: the algae-sim thread. Next action: pin AutoLab
-  `e9f8421`, migrate `algae_sim/autolab/_convert.py` and device core, then re-run its
-  end-to-end campaign. AutoLab waits; afterwards run `configs/culture-algae-sim.yaml`
-  against it.
-- **Stage 8 parallel batches.** Owner: an AutoLab session, once algae-sim is on v2.
-  Scope is in `STATE.md` → Next 3.
+- algae-sim v2 migration: done in algae-sim `fe01b0c`, pinned to `e9f8421`, local and
+  not pushed. Its end-to-end run of `configs/culture-algae-sim.yaml` completes, with QC
+  catching exactly its injected faults (algae-sim's report; not re-run from AutoLab).
+  Pushing algae-sim is Steven's call, in that repo.
+- **Stage 8 parallel batches.** Owner: the next AutoLab session; unblocked. Scope is in
+  `STATE.md` → Next 1.
 - GitHub CI passed on `e9f8421` (run 42935650970).
 - Merged local branches are still present; delete them when convenient.
 
