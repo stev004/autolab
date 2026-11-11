@@ -189,6 +189,7 @@ private state. See the
 
 ## Read next
 
+- [Current state and next steps](STATE.md)
 - [Architecture](docs/architecture.md)
 - [Physical-lab readiness](docs/physical-lab-readiness.md)
 - [Scientific semantics](docs/scientific-semantics.md)

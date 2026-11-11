@@ -314,5 +314,14 @@ refuses assay campaigns. `autolab campaign status` works for both.
 - Optimiser retraction of observations later flagged as contaminated.
 - Inoculum tracking, growth-rate model fitting, and time-series storage beyond
   per-experiment evidence (a separate data-pipeline project is planned).
-- A real adapter. The simulated photobioreactor in the separate `algae-sim` project
-  is the intended first controller and sensor pair.
+- A real (non-simulated) bioreactor adapter.
+
+## Reference adapter: algae-sim
+
+The separate `algae-sim` project provides the `algae-sim-reactor` controller: a
+simulated photobioreactor bank with an integrated OD750 probe, `is_simulated=True`,
+and the simulation advanced from the run's clock. It is what
+`configs/culture-algae-sim.yaml` targets. It follows contract v2 once its adapter is
+migrated; see `STATE.md` (Integrations) for its current pin and
+[ADR 0004](adr/0004-culture-controlled-variables.md) for the agreed device facts. Its
+biology is illustrative and unvalidated.
