@@ -42,6 +42,8 @@ uv run autolab campaign report "$CID" --database data/autolab.sqlite3
   tools that let Claude Code draft and interpret campaigns as an untrusted proposer.
   No model API is called. See [agents](docs/agents.md).
 - Requires Python 3.12 or newer.
+- The code was written by AI coding agents under my direction; I designed the
+  system, set the requirements, and reviewed and tested every change.
 
 ## Overview
 
