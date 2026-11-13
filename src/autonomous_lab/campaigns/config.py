@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal, cast
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import (
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from autonomous_lab.domain.base import DomainModel
 from autonomous_lab.domain.enums import CommandType, ControlType
@@ -246,6 +252,36 @@ class OptimizationConfig(DomainModel):
     strategy: Literal["random", "grid", "bayesian"]
     startup_experiments: int = Field(default=12, ge=0)
     maximum_grid_size: int = Field(default=10_000, ge=1)
+    #: Explicit grid levels per parameter, in that parameter's own unit. Grid only.
+    #: The grid is their product, visited in lexicographic order of sorted
+    #: parameter names (the last name varies fastest), levels in the order listed.
+    grid_levels: dict[str, tuple[FiniteDecimal, ...]] | None = None
+
+    @model_validator(mode="after")
+    def _grid_levels_shape(self) -> OptimizationConfig:
+        if self.grid_levels is None:
+            return self
+        if self.strategy != "grid":
+            raise ValueError("grid_levels is only valid with strategy: grid")
+        if not self.grid_levels:
+            raise ValueError("grid_levels must list at least one parameter")
+        for name, levels in self.grid_levels.items():
+            if not levels:
+                raise ValueError(f"grid_levels for {name!r} is empty")
+            if len(set(levels)) != len(levels):
+                raise ValueError(f"grid_levels for {name!r} repeats a value")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_grid_levels(self, handler: SerializerFunctionWrapHandler) -> Any:
+        # Leave the key out when unset so documents written before grid_levels
+        # existed keep their canonical hash.
+        data: object = handler(self)
+        if self.grid_levels is None and isinstance(data, dict):
+            fields = cast(dict[str, Any], data)
+            fields.pop("grid_levels", None)
+            return fields
+        return data
 
 
 class CampaignConfig(DomainModel):
@@ -348,6 +384,13 @@ def validate_grid_budget(
 
     if optimization.strategy != "grid":
         return
+    if optimization.grid_levels is not None:
+        grid_size = _explicit_grid_size(parameter_space, optimization)
+        if max_experiments > grid_size:
+            raise ValueError(
+                f"campaign budget {max_experiments} exceeds finite grid size {grid_size}"
+            )
+        return
     grid_size = 1
     for name, parameter in parameter_space.parameters.items():
         if parameter.resolution is None:
@@ -364,3 +407,44 @@ def validate_grid_budget(
             )
     if max_experiments > grid_size:
         raise ValueError(f"campaign budget {max_experiments} exceeds finite grid size {grid_size}")
+
+
+def _explicit_grid_size(parameter_space: ParameterSpace, optimization: OptimizationConfig) -> int:
+    """Check explicit levels against the search space; return the grid size.
+
+    Each level must lie inside its parameter's range and on its resolution step.
+    The run-time policy ∩ device check of that range then covers every level.
+    """
+
+    levels = optimization.grid_levels
+    assert levels is not None
+    expected = set(parameter_space.parameters)
+    if set(levels) != expected:
+        raise ValueError(
+            "grid_levels must cover every search parameter; "
+            f"missing={sorted(expected - set(levels))}, extra={sorted(set(levels) - expected)}"
+        )
+    grid_size = 1
+    for name, values in sorted(levels.items()):
+        parameter = parameter_space.parameters[name]
+        for value in values:
+            if not parameter.minimum <= value <= parameter.maximum:
+                raise ValueError(
+                    f"grid level {name}={value} is outside "
+                    f"[{parameter.minimum}, {parameter.maximum}] {parameter.unit}"
+                )
+            if (
+                parameter.resolution is not None
+                and (value - parameter.minimum) % parameter.resolution != 0
+            ):
+                raise ValueError(
+                    f"grid level {name}={value} is not on the {parameter.resolution} "
+                    f"{parameter.unit} step from {parameter.minimum}"
+                )
+        grid_size *= len(values)
+    if grid_size > optimization.maximum_grid_size:
+        raise ValueError(
+            f"grid_levels make {grid_size} combinations; "
+            f"maximum_grid_size is {optimization.maximum_grid_size}"
+        )
+    return grid_size

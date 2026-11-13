@@ -22,6 +22,7 @@ from autonomous_lab.domain.enums import CampaignState, ExperimentState
 from autonomous_lab.domain.experiments import ExperimentProposal
 from autonomous_lab.domain.optimization import OptimizationObservation, OptimizationState
 from autonomous_lab.domain.parameters import ParameterSpace
+from autonomous_lab.domain.quantities import QuantityValue
 from autonomous_lab.domain.state_machines import transition_campaign, transition_experiment
 from autonomous_lab.optimization import (
     FeedbackDisposition,
@@ -152,6 +153,7 @@ def build_strategy(
             seed=seed,
             restored_state=checkpoint,
             maximum_grid_size=optimization.maximum_grid_size,
+            levels=_grid_levels(parameter_space, optimization),
         )
     return OptunaStrategy(
         campaign_id=campaign_id,
@@ -162,6 +164,20 @@ def build_strategy(
         storage_url=optimizer_run.external_storage_uri,
         prefer_gp=prefer_gp,
     )
+
+
+def _grid_levels(
+    parameter_space: ParameterSpace, optimization: OptimizationConfig
+) -> dict[str, tuple[QuantityValue, ...]] | None:
+    if optimization.grid_levels is None:
+        return None
+    return {
+        name: tuple(
+            QuantityValue(value=value, unit=parameter_space.parameters[name].unit)
+            for value in values
+        )
+        for name, values in optimization.grid_levels.items()
+    }
 
 
 class CampaignLedger:

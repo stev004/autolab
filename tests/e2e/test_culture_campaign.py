@@ -751,3 +751,81 @@ def test_a_ph_holding_device_runs_with_ph_optimised_and_co2_minimised(tmp_path: 
         names = set(uow.session.scalars(select(DerivedMetricRecord.name)))
     assert names == {"final_od750", "energy_kwh", "co2_g"}
     assert all("ph" in command.setpoints for command in rig.controllers[0].commands)
+
+
+_BENCHMARK_GRID = {
+    "temperature": [22, 28, 34],
+    "light_intensity": [60, 180, 400],
+    "ph": [6.5, 8.0],
+}
+
+
+def _grid_document(**optimization: Any) -> dict[str, Any]:
+    document = _document()
+    document["parameter_space"]["ph"] = {
+        "kind": "continuous",
+        "unit": "dimensionless",
+        "minimum": 6.5,
+        "maximum": 8.5,
+        "resolution": 0.05,
+    }
+    document["campaign"]["max_experiments"] = 18
+    document["optimization"] = {"strategy": "grid", "grid_levels": _BENCHMARK_GRID, **optimization}
+    return document
+
+
+def test_grid_levels_campaign_proposes_exactly_the_listed_grid(tmp_path: Path) -> None:
+    rig = ScriptedRig(controller_kwargs={"manifest": capabilities(ph=True)})
+    _storage, service = _service(tmp_path, rig)
+    campaign_id = service.create(load_culture_campaign(_write(tmp_path, _grid_document())))
+    status = asyncio.run(service.run(campaign_id))
+    assert status.state is CampaignState.COMPLETED and status.experiment_count == 18
+
+    records = sorted(
+        service.ledger.trial_records(campaign_id), key=lambda r: r.proposal.suggestion_index
+    )
+    proposed = [
+        tuple(
+            record.proposal.parameter_values[name].value
+            for name in ("light_intensity", "ph", "temperature")
+        )
+        for record in records
+    ]
+    # Lexicographic over sorted names, levels in listed order; temperature varies fastest.
+    expected = [
+        (Decimal(str(light)), Decimal(str(ph)), Decimal(str(temperature)))
+        for light in _BENCHMARK_GRID["light_intensity"]
+        for ph in _BENCHMARK_GRID["ph"]
+        for temperature in _BENCHMARK_GRID["temperature"]
+    ]
+    assert proposed == expected
+    assert {record.proposal.strategy_name for record in records} == {"grid"}
+    applied = [command.setpoints for command in rig.controllers[0].commands]
+    assert {
+        tuple(setpoints[name].value for name in ("light_intensity", "ph", "temperature"))
+        for setpoints in applied
+    } == set(expected)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda d: d["optimization"]["grid_levels"].update(ph=[6.5, 8.02]), "not on the 0.05"),
+        (lambda d: d["optimization"]["grid_levels"].update(temperature=[22, 36]), "outside"),
+        (lambda d: d["optimization"]["grid_levels"].pop("ph"), "cover every search parameter"),
+        (lambda d: d["optimization"]["grid_levels"].update(ph=[6.5, 6.5]), "repeats a value"),
+        (lambda d: d["optimization"].update(strategy="random"), "only valid with strategy: grid"),
+        (lambda d: d["campaign"].update(max_experiments=20), "exceeds finite grid size 18"),
+        (lambda d: d["optimization"].update(maximum_grid_size=10), "maximum_grid_size is 10"),
+    ],
+)
+def test_invalid_grid_levels_are_refused_at_load(tmp_path: Path, change: Any, message: str) -> None:
+    document = json.loads(json.dumps(_grid_document()))
+    change(document)
+    with pytest.raises(ConfigurationLoadError, match=message):
+        load_culture_campaign(_write(tmp_path, document))
+
+
+def test_absent_grid_levels_leave_the_document_unchanged() -> None:
+    loaded = load_culture_campaign(PROJECT_ROOT / "configs" / "culture-algae-sim.yaml")
+    assert "grid_levels" not in loaded.config.optimization.model_dump()
