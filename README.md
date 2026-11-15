@@ -27,8 +27,9 @@ uv run autolab campaign report "$CID" --database data/autolab.sqlite3
 
 ## Status and limitations
 
-- Research software (last tagged release 0.5.0; stages 6 and 7, culture campaigns
-  and the research-agent boundary, landed after it). It is not production software.
+- Research software (last tagged release 0.5.0; stages 6 to 8 so far, culture
+  campaigns, the research-agent boundary and parallel reactor batches, landed
+  after it). It is not production software.
 - It runs in simulation, with a human in the loop, and with fixture-backed
   measurements.
 - There are no real hardware drivers yet. The hardware seam is designed
