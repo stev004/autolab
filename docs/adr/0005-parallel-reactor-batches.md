@@ -1,7 +1,7 @@
 # ADR 0005: Parallel reactor batches (stage 8, first slice)
 
 - Status: accepted. Approved by the algae-sim session under Steven's delegation,
-  2026-11-15. Implemented on branch `stage8-parallel-batches`.
+  2026-11-15. Implemented: `16636dc` (on `main`, pushed).
 - Date: 2026-11-15
 - Requested by: Steven, via the algae-sim session ("yeah kick of stage 8's first slice")
 - Scope: `STATE.md` → Next 1 only. Multi-campaign scheduling, pre-registration and
