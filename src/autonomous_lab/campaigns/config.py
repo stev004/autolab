@@ -256,6 +256,9 @@ class OptimizationConfig(DomainModel):
     #: The grid is their product, visited in lexicographic order of sorted
     #: parameter names (the last name varies fastest), levels in the order listed.
     grid_levels: dict[str, tuple[FiniteDecimal, ...]] | None = None
+    #: Conditions asked per round. Culture campaigns run each on its own reactor
+    #: group, concurrently (ADR 0005). 1 is the sequential loop.
+    batch_size: int = Field(default=1, ge=1)
 
     @model_validator(mode="after")
     def _grid_levels_shape(self) -> OptimizationConfig:
@@ -273,13 +276,16 @@ class OptimizationConfig(DomainModel):
         return self
 
     @model_serializer(mode="wrap")
-    def _omit_absent_grid_levels(self, handler: SerializerFunctionWrapHandler) -> Any:
-        # Leave the key out when unset so documents written before grid_levels
-        # existed keep their canonical hash.
+    def _omit_defaults_added_later(self, handler: SerializerFunctionWrapHandler) -> Any:
+        # Leave out keys added after v0.5 while they hold their defaults, so
+        # documents written before them keep their canonical hash.
         data: object = handler(self)
-        if self.grid_levels is None and isinstance(data, dict):
+        if isinstance(data, dict):
             fields = cast(dict[str, Any], data)
-            fields.pop("grid_levels", None)
+            if self.grid_levels is None:
+                fields.pop("grid_levels", None)
+            if self.batch_size == 1:
+                fields.pop("batch_size", None)
             return fields
         return data
 
@@ -298,6 +304,8 @@ class CampaignConfig(DomainModel):
     def _v0_semantics(self) -> CampaignConfig:
         if self.optimization.startup_experiments > self.campaign.max_experiments:
             raise ValueError("startup_experiments cannot exceed campaign max_experiments")
+        if self.optimization.batch_size != 1:
+            raise ValueError("assay campaigns run one experiment at a time; batch_size must be 1")
         if self.simulation.model != ASSAY_MODEL_CONFIG_NAME:
             raise ValueError(f"unsupported V0 simulator model: {self.simulation.model!r}")
         self._validate_parameter_space()

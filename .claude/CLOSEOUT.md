@@ -20,6 +20,7 @@ Closed-loop lab platform (propose → validate → execute → measure → learn
 | Install, run, develop commands; status & limitations | `README.md` |
 | Example configs and trusted policies | `configs/*.yaml` (comments explain values) |
 | Optimiser settings (strategies, `grid_levels`, seeding, sampler choice) | `docs/culture.md` (Optimiser settings) |
+| Parallel reactor batches (`batch_size`, groups, rounds, batch resume) | `docs/culture.md` (Parallel reactor batches) + `docs/adr/0005-parallel-reactor-batches.md` |
 | algae-sim integration (pins, contract version, adapter name) | `STATE.md` (Integrations) + `docs/culture.md` |
 
 ## State snapshot (MANDATORY — registered in StevOS sync registry as `STATE.md`)

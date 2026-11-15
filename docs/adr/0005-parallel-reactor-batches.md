@@ -1,6 +1,7 @@
 # ADR 0005: Parallel reactor batches (stage 8, first slice)
 
-- Status: proposed (design note for Steven's approval; no code yet)
+- Status: accepted. Approved by the algae-sim session under Steven's delegation,
+  2026-11-15. Implemented on branch `stage8-parallel-batches`.
 - Date: 2026-11-15
 - Requested by: Steven, via the algae-sim session ("yeah kick of stage 8's first slice")
 - Scope: `STATE.md` → Next 1 only. Multi-campaign scheduling, pre-registration and
@@ -87,7 +88,13 @@ wrappers. Neither requires an adapter change.
 
 ### Optimiser
 
-- **Optuna (`bayesian`)** in 4.9:
+- **Optuna (`bayesian`)** in 4.9. Checked in the installed source:
+  `_split_trials` puts RUNNING trials in the "above" set before the feasibility
+  split. So with several objectives they never enter the below-set weights, and
+  with `constraints_func` their missing constraint values are never read. The
+  path is supported; it is experimental, like `constraints_func`. A unit test
+  asks a k = 3 round on the 3-objective, constrained culture objective and checks
+  for 3 distinct, in-bounds proposals and no warnings.
   - TPE gets `constant_liar=True` when `batch_size > 1`. It then treats running
     trials as pessimistic lies, so the k proposals in a round spread out instead
     of clustering.
@@ -137,7 +144,14 @@ wrappers. Neither requires an adapter change.
 ### Reporting
 
 - `replicates_per_experiment` becomes the group size.
-- The report adds `batch_size` and the number of rounds. Nothing else changes.
+- `culture report` gains a `batching` block:
+  - `batch_size`, `reactor_groups` and `rounds`;
+  - `startup_experiments`, and `planned_random_startup`, which is the start-up
+    rounded up to a whole round (9 at k = 3, startup 8);
+  - `random_startup`, the actual count, from each experiment's observed trials
+    when its round was asked;
+  - per experiment: ordinal, round, slot, reactor group, state and
+    `random_startup`.
 
 ## Tests (planned)
 

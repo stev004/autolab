@@ -50,9 +50,14 @@ class SteppedClock:
         return self._now
 
     async def sleep_until(self, when: datetime) -> None:
+        self.advance_to(when)
+        await asyncio.sleep(0)
+
+    def advance_to(self, when: datetime) -> None:
+        """Jump forward to ``when`` (never backwards) and notify listeners."""
+
         require_utc(when)
         if when > self._now:
             self._now = when
             for listener in self._listeners:
                 listener(when)
-        await asyncio.sleep(0)

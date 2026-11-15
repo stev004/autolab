@@ -69,10 +69,16 @@ class OptunaStrategy(OptimizationStrategy):
         storage_url: str | None = None,
         study_name: str | None = None,
         prefer_gp: bool = True,
+        batch_size: int = 1,
         restored_state: OptimizationState | None = None,
     ) -> None:
         if startup_experiments < 0:
             raise ValueError("startup_experiments must be non-negative")
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        # Proposals are asked a round of ``batch_size`` at a time; the round's
+        # earlier trials are RUNNING when its later ones are asked (ADR 0005).
+        self.batch_size = batch_size
         unsupported = tuple(
             name
             for name, parameter in sorted(problem.parameter_space.parameters.items())
@@ -92,7 +98,7 @@ class OptunaStrategy(OptimizationStrategy):
         self._locally_sampled_trials: set[int] = set()
         self._sampler_reconstructed = False
         sampler, sampler_name = self._select_sampler(
-            self._sampler_seed(seed, 0), startup_experiments, prefer_gp
+            self._sampler_seed(seed, 0), startup_experiments, prefer_gp, batch_size
         )
         self.sampler_name = sampler_name
         directions = [metric.direction.value for metric in problem.objective_metrics]
@@ -125,8 +131,19 @@ class OptunaStrategy(OptimizationStrategy):
 
     @staticmethod
     def _select_sampler(
-        seed: int, startup_experiments: int, prefer_gp: bool
+        seed: int, startup_experiments: int, prefer_gp: bool, batch_size: int = 1
     ) -> tuple[BaseSampler, str]:
+        """Choose the sampler for one trial.
+
+        GPSampler conditions on RUNNING trials natively. TPE does so only with
+        ``constant_liar``, which is set for batches alone: a sequential campaign
+        never has a RUNNING trial at ask time, and keeps the exact sampler it had.
+        Constant liar with several objectives and ``constraints_func`` is a
+        supported path in Optuna 4.9 (running trials always go to the "above"
+        set, before the feasibility split); it is experimental, like
+        ``constraints_func`` itself.
+        """
+
         torch_available = False
         if prefer_gp:
             try:
@@ -156,6 +173,7 @@ class OptunaStrategy(OptimizationStrategy):
                 n_startup_trials=startup_experiments,
                 multivariate=True,
                 constraints_func=_constraints_from_trial,
+                constant_liar=batch_size > 1,
             )
         return sampler, "optuna_tpe"
 
@@ -292,41 +310,66 @@ class OptunaStrategy(OptimizationStrategy):
     ) -> None:
         """Audit and restore one native RUNNING trial across a human wait."""
 
+        self.reconcile_pending_batch(records, (pending,))
+
+    def reconcile_pending_batch(
+        self,
+        records: Sequence[TrialRecord],
+        pending: Sequence[ExperimentProposal],
+    ) -> None:
+        """Audit and restore native RUNNING trials, all in the final batch round.
+
+        Terminal records plus pending proposals must cover trials 0..n-1. A
+        sequential campaign has at most one pending proposal, always the last.
+        """
+
         ordered = tuple(sorted(records, key=lambda item: item.proposal.suggestion_index))
-        self._reconstruct_sampler_state(ordered, pending=pending)
+        waiting = tuple(sorted(pending, key=lambda item: item.suggestion_index))
+        if not waiting:
+            raise OptunaReconciliationError("no pending proposal to reconcile")
+        self._reconstruct_sampler_state(ordered, pending=waiting)
+        numbers = [self._parse_trial_number(item.strategy_trial_id) for item in waiting]
+        if any(
+            number != item.suggestion_index for number, item in zip(numbers, waiting, strict=True)
+        ):
+            raise OptunaReconciliationError("pending Optuna proposal does not match its trial")
+        total = len(ordered) + len(waiting)
+        if min(numbers) // self.batch_size != (total - 1) // self.batch_size:
+            raise OptunaReconciliationError("pending Optuna proposals are not in the final round")
         OptimizationStrategy.reconcile(self, ordered)
-        number = self._parse_trial_number(pending.strategy_trial_id)
-        if number != pending.suggestion_index or number != len(ordered):
-            raise OptunaReconciliationError(
-                "pending Optuna proposal is not contiguous after terminal history"
+        native = {item.number: item for item in self.study.trials}
+        for number, item in zip(numbers, waiting, strict=True):
+            frozen = native.get(number)
+            if frozen is None or frozen.state is not TrialState.RUNNING:
+                raise OptunaReconciliationError(
+                    "pending authoritative proposal has no matching native RUNNING trial"
+                )
+            placeholder = TrialRecord(
+                item,
+                StrategyFeedback.excluded(
+                    item.strategy_trial_id,
+                    FeedbackDisposition.EXECUTION_FAILED,
+                    reason="pending-reconciliation-placeholder",
+                ),
             )
-        frozen = {item.number: item for item in self.study.trials}.get(number)
-        if frozen is None or frozen.state is not TrialState.RUNNING:
-            raise OptunaReconciliationError(
-                "pending authoritative proposal has no matching native RUNNING trial"
-            )
-        placeholder = TrialRecord(
-            pending,
-            StrategyFeedback.excluded(
-                pending.strategy_trial_id,
-                FeedbackDisposition.EXECUTION_FAILED,
-                reason="pending-reconciliation-placeholder",
-            ),
-        )
-        self._audit_trial_shape(frozen, placeholder)
-        self._reconcile_orphans(set(range(len(ordered))) | {number})
-        self.problem.parameter_space.validate_values(pending.parameter_values)
-        if pending.strategy_trial_id in self._terminal:
-            raise OptunaReconciliationError("pending proposal already has terminal feedback")
-        self._register_proposal(pending)
-        self._suggestion_count = max(self._suggestion_count, pending.suggestion_index + 1)
+            self._audit_trial_shape(frozen, placeholder)
+        terminal_numbers = {
+            self._parse_trial_number(record.proposal.strategy_trial_id) for record in ordered
+        }
+        self._reconcile_orphans(terminal_numbers | set(numbers))
+        for item in waiting:
+            self.problem.parameter_space.validate_values(item.parameter_values)
+            if item.strategy_trial_id in self._terminal:
+                raise OptunaReconciliationError("pending proposal already has terminal feedback")
+            self._register_proposal(item)
+            self._suggestion_count = max(self._suggestion_count, item.suggestion_index + 1)
         self._sampler_replay_required = False
 
     def _reconstruct_sampler_state(
         self,
         records: Sequence[TrialRecord],
         *,
-        pending: ExperimentProposal | None = None,
+        pending: Sequence[ExperimentProposal] = (),
     ) -> None:
         """Rebuild historical proposals with their deterministic per-trial samplers.
 
@@ -334,6 +377,10 @@ class OptunaStrategy(OptimizationStrategy):
         therefore derives an independent seed from the campaign seed and suggestion
         index. Shadow studies validate every historical proposal without modifying the
         execution study, so version drift or an incompatible sampler fails closed.
+
+        Proposals are replayed a round of ``batch_size`` at a time, as they were
+        asked: every trial of a round is asked (earlier ones RUNNING) before any of
+        it is told. With ``batch_size`` 1 that is one trial per round.
         """
 
         if self._sampler_reconstructed:
@@ -341,7 +388,7 @@ class OptunaStrategy(OptimizationStrategy):
         if self._locally_sampled_trials:
             self._sampler_reconstructed = True
             return
-        if not records and pending is None:
+        if not records and not pending:
             if self._sampler_replay_required:
                 raise OptunaReconciliationError(
                     "cannot reconstruct a resumed Optuna sampler without authoritative trials"
@@ -349,70 +396,85 @@ class OptunaStrategy(OptimizationStrategy):
             self._sampler_reconstructed = True
             return
 
-        directions = [metric.direction.value for metric in self.problem.objective_metrics]
-        shadow_trials: list[FrozenTrial] = []
-        for expected_number, record in enumerate(records):
-            number = self._parse_trial_number(record.proposal.strategy_trial_id)
-            if number != expected_number or record.proposal.suggestion_index != expected_number:
+        entries: list[TrialRecord | ExperimentProposal] = [*records, *pending]
+        entries.sort(
+            key=lambda item: (
+                item.proposal.suggestion_index
+                if isinstance(item, TrialRecord)
+                else item.suggestion_index
+            )
+        )
+        for expected_number, entry in enumerate(entries):
+            proposal = entry.proposal if isinstance(entry, TrialRecord) else entry
+            number = self._parse_trial_number(proposal.strategy_trial_id)
+            if number != expected_number or proposal.suggestion_index != expected_number:
                 raise OptunaReconciliationError(
                     "authoritative Optuna history is not contiguous from trial zero"
                 )
-            sampler = self._sampler_for_trial(expected_number)
-            shadow = optuna.create_study(sampler=sampler, directions=directions)
-            for historical_trial in shadow_trials:
-                shadow.add_trial(historical_trial)
-            shadow_trial = shadow.ask()
-            replayed_values = self._suggest_trial_values(shadow_trial)
-            self._audit_replayed_proposal(replayed_values, record)
-            shadow_trial.set_user_attr(
-                _PARAMETERS_ATTRIBUTE,
-                {name: str(value.value) for name, value in sorted(replayed_values.items())},
-            )
-            feedback = record.feedback
-            if feedback.disposition is FeedbackDisposition.OBSERVED:
-                observation = feedback.observation
-                if observation is None:
-                    raise AssertionError("authoritative observed record has no observation")
-                shadow_trial.set_user_attr(
-                    _CONSTRAINTS_ATTRIBUTE,
-                    [
-                        float(observation.constraint_residuals[name])
-                        for name in self.problem.constraint_names
-                    ],
-                )
-                shadow.tell(
-                    shadow_trial,
-                    values=[
-                        float(observation.objective_values[name])
-                        for name in self.problem.objective_names
-                    ],
-                    state=TrialState.COMPLETE,
-                )
-            else:
-                shadow.tell(shadow_trial, state=TrialState.FAIL)
-            shadow_trials = shadow.trials
-        if pending is not None:
-            expected_number = len(records)
-            number = self._parse_trial_number(pending.strategy_trial_id)
-            if number != expected_number or pending.suggestion_index != expected_number:
+        last_round = (len(entries) - 1) // self.batch_size
+        for item in pending:
+            if item.suggestion_index // self.batch_size != last_round:
                 raise OptunaReconciliationError(
-                    "pending authoritative Optuna proposal is not contiguous"
+                    "pending authoritative Optuna proposal is not in the final round"
                 )
-            sampler = self._sampler_for_trial(expected_number)
-            shadow = optuna.create_study(sampler=sampler, directions=directions)
+
+        directions = [metric.direction.value for metric in self.problem.objective_metrics]
+        shadow_trials: list[FrozenTrial] = []
+        for round_start in range(0, len(entries), self.batch_size):
+            round_entries = entries[round_start : round_start + self.batch_size]
+            shadow = optuna.create_study(
+                sampler=self._sampler_for_trial(round_start), directions=directions
+            )
             for historical_trial in shadow_trials:
                 shadow.add_trial(historical_trial)
-            shadow_trial = shadow.ask()
-            replayed_values = self._suggest_trial_values(shadow_trial)
-            placeholder = TrialRecord(
-                pending,
-                StrategyFeedback.excluded(
-                    pending.strategy_trial_id,
-                    FeedbackDisposition.EXECUTION_FAILED,
-                    reason="pending-replay-placeholder",
-                ),
-            )
-            self._audit_replayed_proposal(replayed_values, placeholder)
+            asked: list[tuple[Trial, TrialRecord | ExperimentProposal]] = []
+            for offset, entry in enumerate(round_entries):
+                shadow.sampler = self._sampler_for_trial(round_start + offset)
+                shadow_trial = shadow.ask()
+                replayed_values = self._suggest_trial_values(shadow_trial)
+                if isinstance(entry, TrialRecord):
+                    audited = entry
+                else:
+                    audited = TrialRecord(
+                        entry,
+                        StrategyFeedback.excluded(
+                            entry.strategy_trial_id,
+                            FeedbackDisposition.EXECUTION_FAILED,
+                            reason="pending-replay-placeholder",
+                        ),
+                    )
+                self._audit_replayed_proposal(replayed_values, audited)
+                shadow_trial.set_user_attr(
+                    _PARAMETERS_ATTRIBUTE,
+                    {name: str(value.value) for name, value in sorted(replayed_values.items())},
+                )
+                asked.append((shadow_trial, entry))
+            for shadow_trial, entry in asked:
+                if not isinstance(entry, TrialRecord):
+                    continue  # pending: stays RUNNING, as it is natively
+                feedback = entry.feedback
+                if feedback.disposition is FeedbackDisposition.OBSERVED:
+                    observation = feedback.observation
+                    if observation is None:
+                        raise AssertionError("authoritative observed record has no observation")
+                    shadow_trial.set_user_attr(
+                        _CONSTRAINTS_ATTRIBUTE,
+                        [
+                            float(observation.constraint_residuals[name])
+                            for name in self.problem.constraint_names
+                        ],
+                    )
+                    shadow.tell(
+                        shadow_trial,
+                        values=[
+                            float(observation.objective_values[name])
+                            for name in self.problem.objective_names
+                        ],
+                        state=TrialState.COMPLETE,
+                    )
+                else:
+                    shadow.tell(shadow_trial, state=TrialState.FAIL)
+            shadow_trials = shadow.trials
         self._sampler_reconstructed = True
 
     def _install_sampler_for_trial(self, suggestion_index: int) -> None:
@@ -441,6 +503,7 @@ class OptunaStrategy(OptimizationStrategy):
             self._sampler_seed(self.seed, suggestion_index),
             self.startup_experiments,
             self.sampler_name == "optuna_gp",
+            self.batch_size,
         )
         if sampler_name != self.sampler_name:
             raise OptunaReconciliationError(

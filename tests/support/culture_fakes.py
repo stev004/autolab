@@ -189,9 +189,13 @@ class ScriptedController:
     reactor_faults: dict[str, tuple[str, ...]] = field(default_factory=dict)
     #: Simulates a device that forgot what it was holding (e.g. after a power cut).
     forget_commands: bool = False
+    #: Reactors whose setpoints are refused (e.g. one faulty vessel in a bank).
+    refused_reactors: frozenset[str] = frozenset()
     #: Raised by read_telemetry, e.g. to simulate an unreachable controller.
     telemetry_failure: ControllerError | None = None
     commands: list[SetpointCommand] = field(default_factory=list)
+    #: Simulated time each command arrived (parallel to ``commands``).
+    command_times: list[datetime] = field(default_factory=list)
     safe_state_calls: list[str] = field(default_factory=list)
     safe_state_reactors: list[str] = field(default_factory=list)
     applied: dict[str, SetpointCommand] = field(default_factory=dict)
@@ -216,8 +220,11 @@ class ScriptedController:
 
     async def apply_setpoints(self, command: SetpointCommand) -> SetpointAcknowledgement:
         self.commands.append(command)
+        self.command_times.append(self.clock.now())
         if self.setpoint_failure is not None:
             raise self.setpoint_failure
+        if command.reactor_id in self.refused_reactors:
+            return self._reject(command, "reactor_fault")
         # Exact key set: unknown or missing variables are refused.
         if set(command.setpoints) != set(self.manifest.controlled_variables):
             return self._reject(command, "setpoints_do_not_match_device")

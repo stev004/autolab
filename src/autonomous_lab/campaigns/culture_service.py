@@ -28,7 +28,8 @@ Durability and long-running state (see ``docs/culture.md``):
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+import asyncio
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -72,6 +73,12 @@ from autonomous_lab.culture import (
     SetpointAcknowledgement,
     SteppedClock,
     WallClock,
+)
+from autonomous_lab.culture.batch import (
+    LockstepClock,
+    SerialController,
+    SharedSensor,
+    shared_clock,
 )
 from autonomous_lab.culture.compiler import CultureProtocolCompiler
 from autonomous_lab.culture.qc import QC_VERSION
@@ -227,13 +234,15 @@ class CultureCampaignService:
         if CampaignState(campaign.state) is CampaignState.COMPLETED:
             return self.status(campaign_id)
         self._close_unstarted(campaign_id)
-        pending = self._pending(campaign_id)
+        pending = self._pending(campaign_id, config.optimization.batch_size)
         strategy = self._strategy(campaign_id, config, optimizer_run, checkpoint)
-        records = self.ledger.trial_records(campaign_id, allow_human_pending=pending is not None)
-        if pending is None:
+        records = self.ledger.trial_records(campaign_id, allow_human_pending=bool(pending))
+        if not pending:
             strategy.reconcile(records)
+        elif len(pending) == 1:
+            strategy.reconcile_pending(records, pending[0][1])
         else:
-            strategy.reconcile_pending(records, pending[1])
+            strategy.reconcile_pending_batch(records, [proposal for _, proposal in pending])
         self.ledger.finalize_pending_observations(campaign_id, optimizer_run.id, strategy)
 
         clock = self.clock_factory(config)
@@ -250,10 +259,18 @@ class CultureCampaignService:
             on_interrupt=config.execution.on_interrupt,
         )
 
-        if pending is not None:
-            experiment, proposal = pending
+        if len(pending) == 1:
+            experiment, proposal = pending[0]
             keep_going = await self._recover(
                 config, optimizer_run.id, strategy, experiment, proposal, runner
+            )
+            if self.progress_callback is not None:
+                self.progress_callback(self.status(campaign_id))
+            if not keep_going:
+                return self.status(campaign_id)
+        elif pending:
+            keep_going = await self._recover_round(
+                config, optimizer_run.id, strategy, pending, rig, clock
             )
             if self.progress_callback is not None:
                 self.progress_callback(self.status(campaign_id))
@@ -269,10 +286,21 @@ class CultureCampaignService:
             ):
                 self.ledger.pause(campaign_id, optimizer_run.id)
                 return self.status(campaign_id)
-            proposal = strategy.ask()
-            keep_going = await self._run_experiment(
-                config, optimizer_run.id, strategy, proposal, runner
-            )
+            batch_size = config.optimization.batch_size
+            if batch_size == 1:
+                proposal = strategy.ask()
+                keep_going = await self._run_experiment(
+                    config, optimizer_run.id, strategy, proposal, runner
+                )
+            else:
+                # A round: ask every condition before any is told (ADR 0005).
+                remaining = config.campaign.max_experiments - self.ledger.experiment_count(
+                    campaign_id
+                )
+                proposals = [strategy.ask() for _ in range(min(batch_size, remaining))]
+                keep_going = await self._run_round(
+                    config, optimizer_run.id, strategy, proposals, rig, clock
+                )
             if self.progress_callback is not None:
                 self.progress_callback(self.status(campaign_id))
             if not keep_going:
@@ -397,6 +425,7 @@ class CultureCampaignService:
             uow.commit()
         flagged = {str(item["experiment_id"]) for item in flags}
         simulated = sum(1 for item in provenance if item.get("is_mock") is True)
+        batching = self._batching(campaign_id, config)
         return {
             "title": "AutoLab culture campaign results",
             "campaign_id": str(campaign_id),
@@ -408,7 +437,8 @@ class CultureCampaignService:
             "aborted_experiments": status.aborted_count,
             "qc_failures": status.qc_failed_count,
             "valid_observations": status.valid_observation_count,
-            "replicates_per_experiment": len(config.culture_design.reactor_ids),
+            "replicates_per_experiment": len(config.reactor_groups()[0]),
+            "batching": batching,
             "pareto_frontier": [
                 item for item in status.pareto_frontier if str(item["experiment_id"]) not in flagged
             ],
@@ -432,6 +462,60 @@ class CultureCampaignService:
                 "campaign_config_sha256": campaign.config_sha256,
                 "culture_policy_sha256": self.policy.sha256,
             },
+        }
+
+    def _batching(self, campaign_id: UUID, config: CultureCampaignConfig) -> dict[str, object]:
+        """Round, slot and reactor group per experiment, and the random start-up.
+
+        round = ordinal // batch_size and slot = ordinal % batch_size. Optuna samples
+        at random while fewer than ``startup_experiments`` trials are complete
+        (observed) when a trial is asked, and a round's trials are all asked before
+        any is told, so batching lengthens the start-up to a round boundary.
+        """
+
+        batch_size = config.optimization.batch_size
+        groups = config.reactor_groups()
+        with self.storage.unit_of_work() as uow:
+            experiments = sorted(
+                uow.experiments.list_for_campaign(str(campaign_id)), key=lambda item: item.ordinal
+            )
+            uow.commit()
+        observed_states = {ExperimentState.ANALYSED.value, ExperimentState.OBSERVED.value}
+        bayesian = config.optimization.strategy == "bayesian"
+        startup = config.optimization.startup_experiments
+        rows: list[dict[str, object]] = []
+        for item in experiments:
+            round_index, slot = divmod(item.ordinal, batch_size)
+            complete_at_ask = sum(
+                1
+                for other in experiments
+                if other.ordinal < round_index * batch_size and other.state in observed_states
+            )
+            rows.append(
+                {
+                    "experiment_id": item.id,
+                    "ordinal": item.ordinal,
+                    "round": round_index,
+                    "slot": slot,
+                    "reactor_ids": list(groups[slot]),
+                    "state": item.state,
+                    "random_startup": (complete_at_ask < startup) if bayesian else None,
+                }
+            )
+        planned = -(-startup // batch_size) * batch_size
+        return {
+            "batch_size": batch_size,
+            "reactor_groups": [list(group) for group in groups],
+            "rounds": -(-len(experiments) // batch_size),
+            "startup_experiments": startup if bayesian else None,
+            # If every experiment is observed; failed or QC-failed ones extend it.
+            "planned_random_startup": (
+                min(planned, config.campaign.max_experiments) if bayesian else None
+            ),
+            "random_startup": (
+                sum(1 for row in rows if row["random_startup"]) if bayesian else None
+            ),
+            "experiments": rows,
         }
 
     # ------------------------------------------------------- run internals
@@ -514,27 +598,42 @@ class CultureCampaignService:
                     )
             uow.commit()
 
-    def _pending(self, campaign_id: UUID) -> tuple[ExperimentRecord, ExperimentProposal] | None:
+    def _pending(
+        self, campaign_id: UUID, batch_size: int
+    ) -> list[tuple[ExperimentRecord, ExperimentProposal]]:
+        """Interrupted experiments; more than one only within the final batch round."""
+
         with self.storage.unit_of_work() as uow:
-            pending = [
-                item
-                for item in uow.experiments.list_for_campaign(str(campaign_id))
-                if item.state in _PENDING
-            ]
+            experiments = uow.experiments.list_for_campaign(str(campaign_id))
+            pending = sorted(
+                (item for item in experiments if item.state in _PENDING),
+                key=lambda item: item.ordinal,
+            )
             if not pending:
                 uow.commit()
-                return None
-            if len(pending) > 1:
+                return []
+            final_round = max(item.ordinal for item in experiments) // batch_size
+            if len(pending) > 1 and any(
+                item.ordinal // batch_size != final_round for item in pending
+            ):
                 raise CampaignExecutionError(
-                    f"more than one interrupted culture: {[item.id for item in pending]}"
+                    "interrupted cultures span more than the final batch round: "
+                    f"{[item.id for item in pending]}"
                 )
             assert uow.session is not None
-            snapshot = uow.session.scalar(
-                select(ProposalRecord.snapshot).where(ProposalRecord.experiment_id == pending[0].id)
-            )
+            snapshots = {
+                experiment_id: snapshot
+                for experiment_id, snapshot in uow.session.execute(
+                    select(ProposalRecord.experiment_id, ProposalRecord.snapshot).where(
+                        ProposalRecord.experiment_id.in_([item.id for item in pending])
+                    )
+                )
+            }
             uow.commit()
-        assert snapshot is not None
-        return pending[0], ExperimentProposal.model_validate(snapshot, strict=False)
+        return [
+            (item, ExperimentProposal.model_validate(snapshots[item.id], strict=False))
+            for item in pending
+        ]
 
     async def _recover(
         self,
@@ -544,6 +643,8 @@ class CultureCampaignService:
         experiment: ExperimentRecord,
         proposal: ExperimentProposal,
         runner: CultureExperimentRunner,
+        *,
+        defer_pause: bool = False,
     ) -> bool:
         interrupted = self._load_interrupted(UUID(experiment.id))
         if interrupted is None:
@@ -580,9 +681,12 @@ class CultureCampaignService:
         try:
             record = await runner.resume(proposal, interrupted, observer=observer, journal=journal)
         except CultureResumeError as exc:
-            self.ledger.pause(proposal.campaign_id, optimizer_run_id, reason=str(exc))
+            if not defer_pause:
+                self.ledger.pause(proposal.campaign_id, optimizer_run_id, reason=str(exc))
             raise CampaignExecutionError(str(exc)) from exc
-        return self._finish(config, optimizer_run_id, strategy, proposal, record, observer)
+        return self._finish(
+            config, optimizer_run_id, strategy, proposal, record, observer, defer_pause=defer_pause
+        )
 
     async def _run_experiment(
         self,
@@ -592,33 +696,174 @@ class CultureCampaignService:
         proposal: ExperimentProposal,
         runner: CultureExperimentRunner,
     ) -> bool:
-        with self.storage.unit_of_work() as uow:
-            uow.experiments.add(
-                experiment_id=str(proposal.experiment_id),
-                campaign_id=str(proposal.campaign_id),
-                ordinal=proposal.suggestion_index,
-                state=ExperimentState.PROPOSED,
-                optimizer_trial_id=proposal.strategy_trial_id,
-                parent_experiment_ids=(str(item) for item in proposal.parent_experiment_ids),
-                created_at=proposal.created_at,
-            )
-            uow.records.add_proposal(
-                proposal_id=str(proposal.proposal_id),
-                experiment_id=str(proposal.experiment_id),
-                schema_version=proposal.schema_version,
-                proposal=proposal,
-                strategy_name=proposal.strategy_name,
-                strategy_version=proposal.strategy_version,
-                strategy_trial_id=proposal.strategy_trial_id,
-                created_at=proposal.created_at,
-            )
-            uow.commit()
+        self._add_proposals((proposal,))
         observer = _DurableObserver(self.storage, self.policy)
         journal = _StorageJournal(self.storage, observer)
         record = await runner.run(
             proposal, config.culture_design, observer=observer, journal=journal
         )
         return self._finish(config, optimizer_run_id, strategy, proposal, record, observer)
+
+    async def _run_round(
+        self,
+        config: CultureCampaignConfig,
+        optimizer_run_id: str,
+        strategy: OptimizationStrategy,
+        proposals: Sequence[ExperimentProposal],
+        rig: CultureRig,
+        clock: CultureClock,
+    ) -> bool:
+        """Run one batch round: every slot concurrently on its own reactor group.
+
+        Each experiment is persisted and told as it finishes. One slot's failure
+        never cancels the others; an execution failure pauses the campaign only
+        once the whole round has finished.
+        """
+
+        self._add_proposals(proposals)
+        batch_size = config.optimization.batch_size
+
+        async def member(runner: CultureExperimentRunner, proposal: ExperimentProposal) -> bool:
+            observer = _DurableObserver(self.storage, self.policy)
+            journal = _StorageJournal(self.storage, observer)
+            design = config.group_design(proposal.suggestion_index % batch_size)
+            record = await runner.run(proposal, design, observer=observer, journal=journal)
+            return self._finish(
+                config, optimizer_run_id, strategy, proposal, record, observer, defer_pause=True
+            )
+
+        return await self._concurrently(
+            config,
+            proposals[0].campaign_id,
+            optimizer_run_id,
+            rig,
+            clock,
+            [lambda runner, item=item: member(runner, item) for item in proposals],
+        )
+
+    async def _recover_round(
+        self,
+        config: CultureCampaignConfig,
+        optimizer_run_id: str,
+        strategy: OptimizationStrategy,
+        pending: Sequence[tuple[ExperimentRecord, ExperimentProposal]],
+        rig: CultureRig,
+        clock: CultureClock,
+    ) -> bool:
+        """Recover every interrupted experiment of the final batch round concurrently."""
+
+        async def member(
+            runner: CultureExperimentRunner,
+            experiment: ExperimentRecord,
+            proposal: ExperimentProposal,
+        ) -> bool:
+            return await self._recover(
+                config, optimizer_run_id, strategy, experiment, proposal, runner, defer_pause=True
+            )
+
+        return await self._concurrently(
+            config,
+            pending[0][1].campaign_id,
+            optimizer_run_id,
+            rig,
+            clock,
+            [
+                lambda runner, experiment=experiment, proposal=proposal: member(
+                    runner, experiment, proposal
+                )
+                for experiment, proposal in pending
+            ],
+        )
+
+    async def _concurrently(
+        self,
+        config: CultureCampaignConfig,
+        campaign_id: UUID,
+        optimizer_run_id: str,
+        rig: CultureRig,
+        clock: CultureClock,
+        members: Sequence[Callable[[CultureExperimentRunner], Awaitable[bool]]],
+    ) -> bool:
+        """Run round members on one shared rig; pause once if any member failed."""
+
+        sensor = SharedSensor(rig.sensor)
+        round_clock = shared_clock(clock)
+        runner = CultureExperimentRunner(
+            controller=SerialController(rig.controller),
+            sensor=sensor,
+            clock=round_clock,
+            policy=self.policy,
+            qc_config=config.culture_qc,
+            compiler=self.compiler,
+            on_interrupt=config.execution.on_interrupt,
+        )
+
+        async def tracked(
+            start: Callable[[CultureExperimentRunner], Awaitable[bool]],
+        ) -> bool:
+            try:
+                return await start(runner)
+            finally:
+                if isinstance(round_clock, LockstepClock):
+                    round_clock.leave()
+
+        if isinstance(round_clock, LockstepClock):
+            for _ in members:
+                round_clock.join()
+        try:
+            outcomes = await asyncio.gather(
+                *(tracked(start) for start in members), return_exceptions=True
+            )
+        finally:
+            await sensor.close_session()
+        failures = [item for item in outcomes if isinstance(item, BaseException)]
+        stopped = [item for item in outcomes if item is False]
+        # Like the sequential loop: execution failures and resume refusals pause the
+        # campaign; any other error propagates and the next run recovers.
+        refusals = [item for item in failures if isinstance(item, CampaignExecutionError)]
+        if refusals or stopped:
+            with self.storage.unit_of_work() as uow:
+                campaign = uow.campaigns.get(str(campaign_id))
+                state = CampaignState(campaign.state)
+                uow.commit()
+            if state is CampaignState.RUNNING:
+                reasons = [str(item) for item in refusals] or [
+                    "culture execution failed in this batch round; see the failed experiments"
+                ]
+                self.ledger.pause(campaign_id, optimizer_run_id, reason="; ".join(reasons))
+        for item in failures:
+            raise item
+        return not stopped
+
+    def _add_proposals(self, proposals: Sequence[ExperimentProposal]) -> None:
+        """Persist proposals in one transaction, so a batch round is atomic."""
+
+        with self.storage.unit_of_work() as uow:
+            for proposal in proposals:
+                self._add_proposal(uow, proposal)
+            uow.commit()
+
+    @staticmethod
+    def _add_proposal(uow: UnitOfWork, proposal: ExperimentProposal) -> None:
+        uow.experiments.add(
+            experiment_id=str(proposal.experiment_id),
+            campaign_id=str(proposal.campaign_id),
+            ordinal=proposal.suggestion_index,
+            state=ExperimentState.PROPOSED,
+            optimizer_trial_id=proposal.strategy_trial_id,
+            parent_experiment_ids=(str(item) for item in proposal.parent_experiment_ids),
+            created_at=proposal.created_at,
+        )
+        uow.records.add_proposal(
+            proposal_id=str(proposal.proposal_id),
+            experiment_id=str(proposal.experiment_id),
+            schema_version=proposal.schema_version,
+            proposal=proposal,
+            strategy_name=proposal.strategy_name,
+            strategy_version=proposal.strategy_version,
+            strategy_trial_id=proposal.strategy_trial_id,
+            created_at=proposal.created_at,
+        )
 
     def _finish(
         self,
@@ -628,8 +873,14 @@ class CultureCampaignService:
         proposal: ExperimentProposal,
         record: CultureExperimentRecord,
         observer: _DurableObserver,
+        *,
+        defer_pause: bool = False,
     ) -> bool:
-        """Persist the outcome atomically, then tell the optimiser."""
+        """Persist the outcome atomically, then tell the optimiser.
+
+        ``defer_pause`` leaves an execution failure's pause to the batch round,
+        which pauses once after every member has finished.
+        """
 
         artifact_id = self._store_record_artifact(proposal, record)
         observation = None
@@ -662,7 +913,7 @@ class CultureCampaignService:
                     observation=observation,
                     observed_at=observation.observed_at,
                 )
-            if record.disposition == "failed":
+            if record.disposition == "failed" and not defer_pause:
                 _pause_in(
                     uow,
                     proposal.campaign_id,

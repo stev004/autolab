@@ -42,6 +42,9 @@ uv run autolab campaign report "$CID" --database data/autolab.sqlite3
 - Stage 7 (research agents) has a first slice: a rule-based agent and `autolab agent`
   tools that let Claude Code draft and interpret campaigns as an untrusted proposer.
   No model API is called. See [agents](docs/agents.md).
+- Stage 8 has a first slice: parallel reactor batches. A culture campaign can ask
+  several conditions per round and run each on its own reactor group at once.
+  See [culture](docs/culture.md#parallel-reactor-batches).
 - Requires Python 3.12 or newer.
 - The code was written by AI coding agents under my direction; I designed the
   system, set the requirements, and reviewed and tested every change.

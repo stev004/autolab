@@ -163,6 +163,7 @@ def build_strategy(
         startup_experiments=optimization.startup_experiments,
         storage_url=optimizer_run.external_storage_uri,
         prefer_gp=prefer_gp,
+        batch_size=optimization.batch_size,
     )
 
 

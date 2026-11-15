@@ -94,9 +94,8 @@ command, telemetry, readings and safe state.
 - A protection trip on one reactor stops and safe-states that reactor only. The
   others continue.
 
-Replicates here are *parallel reactors at the same conditions*. Running
-*different* conditions in parallel (batch proposals) is optimiser-scheduling work
-for a later stage.
+Replicates here are *parallel reactors at the same conditions*. To run
+*different* conditions in parallel, see [Parallel reactor batches](#parallel-reactor-batches).
 
 ## Sampling schedules
 
@@ -309,8 +308,8 @@ refuses assay campaigns. `autolab campaign status` works for both.
 
 - Unattended physical culture, and validated thresholds for any real organism or
   device.
-- Batch proposals (different conditions on parallel reactors at once) and
-  multi-campaign reactor scheduling: stage 8.
+- Multi-campaign reactor scheduling: stage 8. Batch proposals within one campaign
+  are its first slice; see [Parallel reactor batches](#parallel-reactor-batches).
 - Optimiser retraction of observations later flagged as contaminated.
 - Inoculum tracking, growth-rate model fitting, and time-series storage beyond
   per-experiment evidence (a separate data-pipeline project is planned).
@@ -343,6 +342,53 @@ Culture campaigns use the shared `optimization` block (`random`, `grid`, `bayesi
 - **What the optimiser sees.** The replicate mean of each metric over
   QC-passing replicates. A campaign seed does not reach the controller; a
   simulator's own noise seed belongs in `execution.controller.settings`.
+
+## Parallel reactor batches
+
+Stage 8's first slice. Decision record: [ADR 0005](adr/0005-parallel-reactor-batches.md).
+
+```yaml
+optimization: {strategy: bayesian, startup_experiments: 8, batch_size: 3}
+culture_design: {reactor_ids: [r1, r2, r3, r4, r5, r6, r7, r8, r9], minimum_passing_replicates: 2}
+```
+
+- **Groups.** `reactor_ids` is split in order into `batch_size` equal groups, so
+  [r1–r3], [r4–r6], [r7–r9]. Slot *j* of every round runs on group *j*. The reactor
+  count must divide evenly, and `minimum_passing_replicates` applies per group.
+  `batch_size: 1` (the default) is the sequential loop, unchanged, and is left out
+  of the document hash. Assay campaigns refuse `batch_size > 1`.
+- **A round.** Ask `batch_size` proposals (the last round may be smaller to fit
+  `max_experiments`) and persist them in one transaction. Then run them
+  concurrently and persist and tell each result as it finishes. The next round
+  is not asked until every result is told.
+- **Round and slot of an experiment.** `round = experiments.ordinal // batch_size`
+  and `slot = ordinal % batch_size`. `culture report` lists them per experiment
+  under `batching.experiments`, with the reactor group and whether the proposal
+  was random start-up.
+- **Failures stay in their group.** A rejected or QC-failed experiment is excluded,
+  and the campaign continues. An execution failure pauses the campaign, but only
+  after the rest of the round has finished and been told.
+- **Shared rig.** AutoLab serialises controller and sensor calls with a lock and
+  keeps one sensor session open per round, so adapters need not tolerate
+  concurrent calls. Under `clock: simulated`, time advances only once every
+  running group is waiting.
+- **Optimiser.**
+  - TPE uses `constant_liar` for batches only, which works with several
+    objectives and constraints in Optuna 4.9. GP conditions on running trials
+    natively. Random and grid are unaffected.
+  - The per-trial seed is still `seed + ordinal`.
+  - Random start-up runs until `startup_experiments` trials are *complete* when a
+    round is asked, so it extends to a round boundary. With startup 8 and k = 3,
+    9 proposals are random.
+  - `culture report` gives `batching.planned_random_startup` (if every experiment
+    is observed) and `batching.random_startup` (actual; failures extend it, as in
+    sequential runs).
+  - The first `startup_experiments` proposals equal a sequential run's with the
+    same seed.
+- **Resume.** Only the final round can have interrupted experiments. Each recovers
+  as in a sequential campaign (no journal → failed; journal → resume, with the
+  device confirming its hold), concurrently. The optimiser replay re-asks each
+  round before telling it, so later proposals match an uninterrupted run.
 
 ## Reference adapter: algae-sim
 

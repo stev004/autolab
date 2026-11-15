@@ -120,4 +120,36 @@ class CultureCampaignConfig(DomainModel):
                 f"available metrics: {sorted(CULTURE_METRICS)}"
             )
         validate_grid_budget(self.parameter_space, self.optimization, self.campaign.max_experiments)
+        reactors = len(self.culture_design.reactor_ids)
+        batch_size = self.optimization.batch_size
+        if reactors % batch_size:
+            raise ValueError(
+                f"{reactors} reactors cannot be split into batch_size={batch_size} "
+                "equal reactor groups"
+            )
+        minimum = self.culture_design.minimum_passing_replicates
+        if minimum is not None and minimum > reactors // batch_size:
+            raise ValueError(
+                f"minimum_passing_replicates={minimum} exceeds the reactor group size "
+                f"{reactors // batch_size}"
+            )
         return self
+
+    def reactor_groups(self) -> tuple[tuple[str, ...], ...]:
+        """``reactor_ids`` split in order into ``batch_size`` equal groups."""
+
+        return reactor_groups(self.culture_design.reactor_ids, self.optimization.batch_size)
+
+    def group_design(self, slot: int) -> CultureDesign:
+        """The design one batch slot runs: the same, on its own reactor group."""
+
+        if self.optimization.batch_size == 1:
+            return self.culture_design
+        values = self.culture_design.model_dump()
+        values["reactor_ids"] = self.reactor_groups()[slot]
+        return CultureDesign.model_validate(values, strict=False)
+
+
+def reactor_groups(reactor_ids: tuple[str, ...], batch_size: int) -> tuple[tuple[str, ...], ...]:
+    size = len(reactor_ids) // batch_size
+    return tuple(reactor_ids[index * size : (index + 1) * size] for index in range(batch_size))

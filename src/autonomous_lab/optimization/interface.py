@@ -121,7 +121,11 @@ class DuplicateFeedbackError(RuntimeError):
 
 
 class OptimizationStrategy(ABC):
-    """Stateful one-at-a-time ask/tell strategy with an auditable trial ledger."""
+    """Stateful ask/tell strategy with an auditable trial ledger.
+
+    Several proposals may be outstanding at once (a batch round); each is told
+    exactly once.
+    """
 
     strategy_name: str
     strategy_version: str = "1.0.0"
@@ -258,6 +262,25 @@ class OptimizationStrategy(ABC):
             self._suggestion_count,
             pending.suggestion_index + 1,
         )
+
+    def reconcile_pending_batch(
+        self,
+        records: Sequence[TrialRecord],
+        pending: Sequence[ExperimentProposal],
+    ) -> None:
+        """Restore terminal history plus several durable, not-yet-observed proposals.
+
+        Used when a batch round was interrupted; ``pending`` is that round's
+        unfinished proposals.
+        """
+
+        self.reconcile(records)
+        for proposal in sorted(pending, key=lambda item: item.suggestion_index):
+            self.problem.parameter_space.validate_values(proposal.parameter_values)
+            if proposal.strategy_trial_id in self._terminal:
+                raise ValueError("pending proposal already has terminal feedback")
+            self._register_proposal(proposal)
+            self._suggestion_count = max(self._suggestion_count, proposal.suggestion_index + 1)
 
     def _reconcile_backend(self, record: TrialRecord) -> None:
         del record

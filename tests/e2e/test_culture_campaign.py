@@ -829,3 +829,230 @@ def test_invalid_grid_levels_are_refused_at_load(tmp_path: Path, change: Any, me
 def test_absent_grid_levels_leave_the_document_unchanged() -> None:
     loaded = load_culture_campaign(PROJECT_ROOT / "configs" / "culture-algae-sim.yaml")
     assert "grid_levels" not in loaded.config.optimization.model_dump()
+
+
+# --------------------------------------------------- parallel reactor batches
+
+_BANK = tuple(f"reactor-{index}" for index in range(1, 10))
+_BATCH_CAMPAIGN = UUID("5b1f0c7e-3a51-4c43-9d43-2f0a3c6b8e11")
+
+
+def _batch_document(**optimization: Any) -> dict[str, Any]:
+    document = _document()
+    document["campaign"] = {**document["campaign"], "max_experiments": 9}
+    document["culture_design"] = {
+        **document["culture_design"],
+        "reactor_ids": list(_BANK),
+        "minimum_passing_replicates": 2,
+    }
+    document["optimization"] = {
+        "strategy": "bayesian",
+        "startup_experiments": 4,
+        "batch_size": 3,
+        **optimization,
+    }
+    return document
+
+
+def _bank_rig(**controller: Any) -> ScriptedRig:
+    manifest = capabilities(reactor_ids=frozenset(_BANK))
+    return ScriptedRig(controller_kwargs={"manifest": manifest, **controller})
+
+
+def _run_batch_campaign(
+    tmp_path: Path, rig: ScriptedRig, document: dict[str, Any] | None = None
+) -> tuple[Storage, CultureCampaignService, UUID]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    storage, service = _service(tmp_path, rig)
+    campaign_id = service.create(
+        load_culture_campaign(_write(tmp_path, document or _batch_document())),
+        campaign_id=_BATCH_CAMPAIGN,
+    )
+    asyncio.run(service.run(campaign_id))
+    return storage, service, campaign_id
+
+
+def _outcomes(service: CultureCampaignService, campaign_id: UUID) -> list[tuple[Any, ...]]:
+    """Per experiment, in order: parameter values and the observed objective values."""
+
+    with service.storage.unit_of_work() as uow:
+        assert uow.session is not None
+        observed = {
+            row.experiment_id: tuple(sorted(row.objective_values.items()))
+            for row in uow.session.scalars(select(OptimizerObservationRecord))
+        }
+    records = sorted(
+        service.ledger.trial_records(campaign_id), key=lambda r: r.proposal.suggestion_index
+    )
+    return [
+        (
+            tuple(
+                (name, value.value) for name, value in sorted(r.proposal.parameter_values.items())
+            ),
+            observed.get(str(r.proposal.experiment_id)),
+        )
+        for r in records
+    ]
+
+
+def test_batch_of_three_runs_each_condition_on_its_own_reactor_group(tmp_path: Path) -> None:
+    rig = _bank_rig()
+    _, service, campaign_id = _run_batch_campaign(tmp_path / "a", rig)
+    status = service.status(campaign_id)
+    assert status.state is CampaignState.COMPLETED
+    assert status.experiment_count == 9 and status.valid_observation_count == 9
+
+    report = service.report(campaign_id)
+    batching: Any = report["batching"]
+    assert report["replicates_per_experiment"] == 3
+    assert batching["batch_size"] == 3 and batching["rounds"] == 3
+    assert batching["reactor_groups"] == [list(_BANK[0:3]), list(_BANK[3:6]), list(_BANK[6:9])]
+    # startup 4 with k = 3: rounds 0 and 1 (6 trials) are random, not 4.
+    assert batching["planned_random_startup"] == 6 and batching["random_startup"] == 6
+    rows = batching["experiments"]
+    assert [(row["round"], row["slot"]) for row in rows] == [
+        (r, s) for r in range(3) for s in range(3)
+    ]
+    assert [row["random_startup"] for row in rows] == [True] * 6 + [False] * 3
+
+    controller = rig.controllers[0]
+    by_experiment: dict[UUID, list[int]] = {}
+    for index, command in enumerate(controller.commands):
+        by_experiment.setdefault(command.experiment_id, []).append(index)
+    records = sorted(
+        service.ledger.trial_records(campaign_id), key=lambda r: r.proposal.suggestion_index
+    )
+    for record in records:
+        indices = by_experiment[record.proposal.experiment_id]
+        slot = record.proposal.suggestion_index % 3
+        # Replicates stay within the slot's group, all at one condition.
+        assert {controller.commands[i].reactor_id for i in indices} == set(
+            _BANK[3 * slot : 3 * slot + 3]
+        )
+        assert (
+            len(
+                {
+                    tuple(sorted((k, v.value) for k, v in controller.commands[i].setpoints.items()))
+                    for i in indices
+                }
+            )
+            == 1
+        )
+    for round_index in range(3):
+        round_records = records[3 * round_index : 3 * round_index + 3]
+        times = {
+            controller.command_times[i]
+            for r in round_records
+            for i in by_experiment[r.proposal.experiment_id]
+        }
+        # The round's three conditions are distinct, and start together.
+        assert len({tuple(sorted(r.proposal.parameter_values.items())) for r in round_records}) == 3
+        assert times == {START + timedelta(hours=24 * round_index)}
+
+    # Same seed, same world: identical proposals and observations.
+    _, again, again_id = _run_batch_campaign(tmp_path / "b", _bank_rig())
+    assert _outcomes(again, again_id) == _outcomes(service, campaign_id)
+
+
+def test_batch_size_one_is_today_and_keeps_the_hash() -> None:
+    sequential = load_culture_campaign(PROJECT_ROOT / "configs" / "culture-algae-sim.yaml")
+    assert "batch_size" not in sequential.config.optimization.model_dump()
+    assert sequential.config.reactor_groups() == (sequential.config.culture_design.reactor_ids,)
+    assert sequential.config.group_design(0) is sequential.config.culture_design
+
+
+def test_a_failing_group_does_not_sink_the_rest_of_its_round(tmp_path: Path) -> None:
+    rig = _bank_rig(refused_reactors=frozenset({"reactor-5"}))  # slot 1's group
+    storage, service, campaign_id = _run_batch_campaign(tmp_path, rig)
+    status = service.status(campaign_id)
+
+    # The round finishes: slots 0 and 2 are observed and told; then the campaign pauses.
+    assert status.state is CampaignState.PAUSED
+    assert status.experiment_count == 3
+    assert status.execution_failed_count == 1 and status.valid_observation_count == 2
+    assert _count(storage, OptimizerObservationRecord) == 2
+    with storage.unit_of_work() as uow:
+        assert uow.session is not None
+        rows = uow.session.execute(select(ExperimentRecord.ordinal, ExperimentRecord.state)).all()
+        states = {ordinal: state for ordinal, state in rows}
+    assert states == {0: "observed", 1: "failed", 2: "observed"}
+    controller = rig.controllers[0]
+    # Applying stopped at the refused reactor; what was applied went to safe state.
+    assert "reactor-4" in controller.safe_state_reactors
+    assert "reactor-6" not in {command.reactor_id for command in controller.commands}
+
+
+def test_a_qc_failing_group_is_excluded_and_the_campaign_continues(tmp_path: Path) -> None:
+    hot = {"reactor-7": Decimal(3), "reactor-8": Decimal(3)}  # slot 2: 1 of 3 passes
+    _, service, campaign_id = _run_batch_campaign(tmp_path, _bank_rig(reactor_error=hot))
+    status = service.status(campaign_id)
+    assert status.state is CampaignState.COMPLETED
+    assert status.qc_failed_count == 3 and status.valid_observation_count == 6
+
+
+def test_batch_campaign_resumes_mid_round_and_matches_an_uninterrupted_run(
+    tmp_path: Path,
+) -> None:
+    _, reference, reference_id = _run_batch_campaign(tmp_path / "reference", _bank_rig())
+
+    document = _batch_document()
+    document["execution"] = {**document["execution"], "on_interrupt": "keep_holding"}
+    rig = _bank_rig()
+    rig.reuse_controller = True
+    clock = SteppedClock(START)
+    run_dir = tmp_path / "interrupted"
+    run_dir.mkdir()
+    storage, service = _service(run_dir, rig, clock=clock)
+    campaign_id = service.create(
+        load_culture_campaign(_write(run_dir, document)), campaign_id=_BATCH_CAMPAIGN
+    )
+    midway = START + timedelta(hours=36)  # 12 h into round 1
+
+    async def stop_midway() -> None:
+        task = asyncio.ensure_future(service.run(campaign_id))
+        while clock.now() < midway:
+            await asyncio.sleep(0)
+        task.cancel()  # Ctrl-C: every group is cancelled together
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(stop_midway())
+    assert _count(storage, ExperimentRecord, state=ExperimentState.RUNNING.value) == 3
+    controller = rig.controllers[0]
+    assert controller.safe_state_reactors == list(_BANK) * 1  # round 0 ended; round 1 holds
+
+    status = asyncio.run(service.run(campaign_id))
+    assert status.state is CampaignState.COMPLETED and status.valid_observation_count == 9
+    assert len(controller.commands) == 27  # resume never re-sent a setpoint
+    assert _outcomes(service, campaign_id) == _outcomes(reference, reference_id)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda d: d["optimization"].update(batch_size=2), "cannot be split"),
+        (
+            lambda d: d["culture_design"].update(minimum_passing_replicates=4),
+            "exceeds the reactor group size 3",
+        ),
+        (lambda d: d["optimization"].update(batch_size=0), "batch_size"),
+    ],
+)
+def test_invalid_batch_configs_are_refused_at_load(
+    tmp_path: Path, change: Any, message: str
+) -> None:
+    document = json.loads(json.dumps(_batch_document()))
+    change(document)
+    with pytest.raises(ConfigurationLoadError, match=message):
+        load_culture_campaign(_write(tmp_path, document))
+
+
+def test_assay_campaigns_refuse_batches(tmp_path: Path) -> None:
+    document = yaml.safe_load(
+        (PROJECT_ROOT / "configs" / "assay-reagent-reduction.yaml").read_text(encoding="utf-8")
+    )
+    document["optimization"]["batch_size"] = 3
+    path = tmp_path / "assay.yaml"
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    with pytest.raises(ConfigurationLoadError, match="batch_size must be 1"):
+        load_campaign(path)

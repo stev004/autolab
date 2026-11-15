@@ -423,3 +423,169 @@ def _native_trial_data(record: TrialRecord) -> tuple[
         ],
     }
     return params, distributions, values, attrs
+
+
+# --------------------------------------------------------------- batch rounds
+
+
+def _culture_problem() -> OptimizationProblem:
+    """The culture objective: 3 objectives (OD up; energy, CO2 down) plus a constraint."""
+
+    return OptimizationProblem(
+        ParameterSpace(
+            parameters={
+                "temperature": ContinuousParameter(
+                    unit="degC",
+                    minimum=Decimal("20"),
+                    maximum=Decimal("34"),
+                    resolution=Decimal("0.1"),
+                ),
+                "light_intensity": ContinuousParameter(
+                    unit="micromole / meter ** 2 / second",
+                    minimum=Decimal("30"),
+                    maximum=Decimal("400"),
+                    resolution=Decimal("1"),
+                ),
+                "ph": ContinuousParameter(
+                    unit="dimensionless",
+                    minimum=Decimal("6.5"),
+                    maximum=Decimal("8.5"),
+                    resolution=Decimal("0.05"),
+                ),
+            }
+        ),
+        (
+            ObjectiveMetric(
+                name="final_od750", direction=ObjectiveDirection.MAXIMIZE, unit="dimensionless"
+            ),
+            ObjectiveMetric(
+                name="energy_kwh", direction=ObjectiveDirection.MINIMIZE, unit="kilowatt_hour"
+            ),
+            ObjectiveMetric(name="co2_g", direction=ObjectiveDirection.MINIMIZE, unit="gram"),
+        ),
+        (
+            MetricConstraint(
+                metric="co2_g", operator=ConstraintOperator.LTE, threshold=Decimal("20")
+            ),
+        ),
+    )
+
+
+def _culture_feedback(problem: OptimizationProblem, proposal) -> StrategyFeedback:
+    values = {name: float(value.value) for name, value in proposal.parameter_values.items()}
+    observation = build_optimization_observation(
+        problem=problem,
+        campaign_id=proposal.campaign_id,
+        experiment_id=proposal.experiment_id,
+        result_id=uuid4(),
+        metric_values={
+            "final_od750": 2.0
+            - abs(values["temperature"] - 28) / 10
+            + values["light_intensity"] / 1000,
+            "energy_kwh": values["light_intensity"] / 100,
+            "co2_g": 40 - 4 * values["ph"],
+        },
+    )
+    return StrategyFeedback.observed(observation, proposal.strategy_trial_id)
+
+
+def _batch_strategy(problem: OptimizationProblem, storage_url: str | None = None) -> OptunaStrategy:
+    return OptunaStrategy(
+        campaign_id=UUID("0d7b6a8e-6c2f-4b8e-9a43-55a1e3c3f0aa"),
+        problem=problem,
+        seed=4000,
+        startup_experiments=3,
+        storage_url=storage_url,
+        prefer_gp=False,
+        batch_size=3,
+    )
+
+
+def _run_rounds(
+    strategy: OptunaStrategy, problem: OptimizationProblem, rounds: int
+) -> list[TrialRecord]:
+    records: list[TrialRecord] = []
+    for _ in range(rounds):
+        proposals = [strategy.ask() for _ in range(3)]  # all asked before any is told
+        for proposal in proposals:
+            feedback = _culture_feedback(problem, proposal)
+            strategy.tell(feedback)
+            records.append(TrialRecord(proposal, feedback))
+    return records
+
+
+def test_constant_liar_round_on_the_culture_objective_is_distinct_and_in_bounds() -> None:
+    import warnings
+
+    from optuna.samplers import TPESampler
+
+    problem = _culture_problem()
+    strategy = _batch_strategy(problem)
+    _run_rounds(strategy, problem, 1)  # random start-up
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        guided = [strategy.ask() for _ in range(3)]  # model-guided, two RUNNING liars
+    sampler = strategy.study.sampler
+    assert isinstance(sampler, TPESampler) and sampler._constant_liar
+    assert [str(item.message) for item in caught] == []
+    values = [tuple(sorted((k, v.value) for k, v in p.parameter_values.items())) for p in guided]
+    assert len(set(values)) == 3
+    for proposal in guided:
+        problem.parameter_space.validate_values(proposal.parameter_values)
+
+
+def test_sequential_strategy_does_not_use_constant_liar() -> None:
+    from optuna.samplers import TPESampler
+
+    strategy = OptunaStrategy(
+        campaign_id=uuid4(), problem=_culture_problem(), seed=1, prefer_gp=False
+    )
+    strategy.ask()
+    sampler = strategy.study.sampler
+    assert isinstance(sampler, TPESampler) and not sampler._constant_liar
+
+
+def test_batch_resume_mid_round_replays_rounds_and_matches_uninterrupted(tmp_path) -> None:
+    problem = _culture_problem()
+    full = _batch_strategy(problem, f"sqlite:///{tmp_path / 'full.db'}")
+    full_records = _run_rounds(full, problem, 4)
+
+    url = f"sqlite:///{tmp_path / 'resumed.db'}"
+    interrupted = _batch_strategy(problem, url)
+    records = _run_rounds(interrupted, problem, 2)
+    round_three = [interrupted.ask() for _ in range(3)]
+    first = _culture_feedback(problem, round_three[0])
+    interrupted.tell(first)  # one slot finished; two still running at the crash
+    records.append(TrialRecord(round_three[0], first))
+    del interrupted
+
+    resumed = _batch_strategy(problem, url)
+    resumed.reconcile_pending_batch(records, round_three[1:])
+    for proposal in round_three[1:]:
+        feedback = _culture_feedback(problem, proposal)
+        resumed.tell(feedback)
+        records.append(TrialRecord(proposal, feedback))
+    records.sort(key=lambda r: r.proposal.suggestion_index)
+    records.extend(_run_rounds(resumed, problem, 1))
+
+    assert _trial_snapshots(records) == _trial_snapshots(full_records)
+
+
+def test_pending_proposals_outside_the_final_round_are_refused(tmp_path) -> None:
+    problem = _culture_problem()
+    url = f"sqlite:///{tmp_path / 'gap.db'}"
+    strategy = _batch_strategy(problem, url)
+    round_one = [strategy.ask() for _ in range(3)]
+    records = []
+    for proposal in round_one[1:]:
+        feedback = _culture_feedback(problem, proposal)
+        strategy.tell(feedback)
+        records.append(TrialRecord(proposal, feedback))
+    round_two = [strategy.ask() for _ in range(3)]
+    for proposal in round_two:
+        feedback = _culture_feedback(problem, proposal)
+        strategy.tell(feedback)
+        records.append(TrialRecord(proposal, feedback))
+    del strategy
+    with pytest.raises(OptunaReconciliationError, match="final round"):
+        _batch_strategy(problem, url).reconcile_pending_batch(records, [round_one[0]])

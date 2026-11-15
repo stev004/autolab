@@ -56,7 +56,7 @@ contamination handling and biological replicate semantics. See [culture](culture
   create/run/report/reconcile/flag-contamination`.
 
 Not claimed: unattended physical culture, validated thresholds, or any real
-bioreactor run. Batch proposals across reactors belong to stage 8.
+bioreactor run. Batch proposals across reactors are stage 8's first slice.
 
 ## Stage 7 - research-agent layer (first slice implemented)
 
@@ -77,6 +77,14 @@ See [agents](agents.md).
 Support multiple instruments and campaigns, scheduling, resource conflicts,
 cross-campaign evidence, preregistered success criteria, independent confirmation and
 reproducible scientific reports.
+
+- **First slice (implemented): parallel reactor batches.** `optimization.batch_size`
+  asks k conditions per round and runs each on its own reactor group concurrently.
+  Results are told before the next round, and journal and resume stay per
+  experiment. See [ADR 0005](adr/0005-parallel-reactor-batches.md) and
+  [culture](culture.md#parallel-reactor-batches).
+- **Later:** multi-campaign and multi-instrument scheduling, resource conflicts,
+  preregistration and independent confirmation.
 
 ## Deliberately deferred
 

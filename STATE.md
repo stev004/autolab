@@ -4,8 +4,8 @@ Updated: 2026-11-15
 
 ## Stage
 - Done: V0 (simulated assay loop), Stage 2 / v0.5 (human-in-the-loop, sensors, hardening), Stage 6 (biological culture, simulation and contract tests), culture contract v2.
-- Stage 7 (research agents): first slice done. Not started: Stages 3, 4, 5, 8.
-- `main` = `26bfc8b` (pushed to GitHub `stev004/autolab`). 350 tests pass locally (1 skipped: wheel test); ruff and pyright clean. GitHub CI passed on `26bfc8b` (run 43365178603).
+- Stage 7 (research agents): first slice done. Stage 8: first slice (parallel reactor batches) built on branch `stage8-parallel-batches`, not yet merged. Not started: Stages 3, 4, 5.
+- `main` = `26bfc8b` on GitHub `stev004/autolab` (CI passed, run 43365178603). Local `main` is ahead by `79ad855` (STATE only, not pushed). The branch has 363 tests passing (1 skipped: wheel test), with ruff and pyright clean.
 
 ## Current
 - Culture campaigns (`autolab culture create/run/report/reconcile/flag-contamination`):
@@ -16,15 +16,18 @@ Updated: 2026-11-15
   See `docs/culture.md`.
 - Research agents (`autolab agent digest/interpret/draft/review`): a rule-based agent, plus Claude Code as an untrusted proposer via `.claude/skills/autolab-research-agent`. No model API calls, deliberately (cost). See `docs/agents.md`.
 - Explicit grid designs: `optimization.grid_levels: {param: [values]}` (`780937b`), valid only with `strategy: grid`. Checked at load (every parameter, in range, on the resolution step, no repeats, ≤ `maximum_grid_size`, budget ≤ grid size). Order is lexicographic over sorted names. See `docs/culture.md` → Optimiser settings.
+- Parallel reactor batches (branch `stage8-parallel-batches`; [ADR 0005](docs/adr/0005-parallel-reactor-batches.md)):
+  - `optimization.batch_size: k` asks k conditions per round; each runs concurrently on its own reactor group (`reactor_ids` split evenly in order);
+  - results are told before the next round; an execution failure pauses only after the round ends;
+  - per-experiment journal and resume, with Optuna replay by round (TPE `constant_liar` for k > 1);
+  - `culture report` → `batching` gives round, slot and group per experiment and the actual random start-up (9 at k = 3, startup 8). See `docs/culture.md` → Parallel reactor batches.
 - Thresholds and the simulated biology are illustrative and unvalidated. No real hardware has been driven.
 
 ## Next
-1. **Stage 8, first slice: parallel reactor batches.**
-   - batch `ask` of several conditions per round, each condition on its own reactor group (replicates within a group);
-   - run the batch concurrently, then `tell` every result;
-   - per-experiment journal and resume kept.
-
-   Agreed with Steven; not started. algae-sim's reactor bank is the target rig.
+1. **Merge and push `stage8-parallel-batches`.** Waiting on Steven's go-ahead in this repo's session. Then the algae-sim session:
+   - re-pins AutoLab and runs a regression check;
+   - enlarges its reactor bank to 9;
+   - adds a batch arm to its benchmark (k = 3 against sequential, 18 experiments), stating the extra random start-up trial.
 2. Later stage 7 work: a model-backed agent (local model, or an API if affordable) behind `ResearchAgent`, an MCP server, and literature retrieval.
 3. Housekeeping: delete merged local branches (`stage6-*`, `stage7-agents`, `culture-contract-v2`).
 
