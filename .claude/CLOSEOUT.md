@@ -19,6 +19,7 @@ Closed-loop lab platform (propose → validate → execute → measure → learn
 | Human-in-the-loop / physical readiness | `docs/physical-lab-readiness.md` |
 | Install, run, develop commands; status & limitations | `README.md` |
 | Example configs and trusted policies | `configs/*.yaml` (comments explain values) |
+| Optimiser settings (strategies, `grid_levels`, seeding, sampler choice) | `docs/culture.md` (Optimiser settings) |
 | algae-sim integration (pins, contract version, adapter name) | `STATE.md` (Integrations) + `docs/culture.md` |
 
 ## State snapshot (MANDATORY — registered in StevOS sync registry as `STATE.md`)

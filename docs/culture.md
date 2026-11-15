@@ -316,12 +316,39 @@ refuses assay campaigns. `autolab campaign status` works for both.
   per-experiment evidence (a separate data-pipeline project is planned).
 - A real (non-simulated) bioreactor adapter.
 
+## Optimiser settings
+
+Culture campaigns use the shared `optimization` block (`random`, `grid`, `bayesian`).
+
+- **Explicit grid.** `optimization.grid_levels: {param: [values]}` lists the levels
+  per parameter, in that parameter's own unit. It is valid only with
+  `strategy: grid`. The grid is the product of the levels, visited in lexicographic
+  order of sorted parameter names (the last name varies fastest), with levels in
+  the order listed. At load, every search parameter needs levels, and each level
+  must lie inside its parameter's range and on its resolution step. Repeats are
+  refused, the product counts against `maximum_grid_size`, and `max_experiments`
+  cannot exceed it. The run-time policy ∩ device range check then covers every
+  level. Without `grid_levels`, the grid is every resolution step, which is usually
+  far over `maximum_grid_size`.
+- **Seeds.** `bayesian` builds a fresh Optuna sampler per trial, seeded with
+  `campaign seed + suggestion index`, so a resume is exact. As a result,
+  campaigns with adjacent seeds share almost the same start-up points: trial *i*
+  of seed *s* uses the same sampler seed as trial *i − 1* of seed *s + 1*. For
+  independent repeats, space seeds at least `max_experiments` apart. `random`
+  hashes the seed, strategy and index, so its adjacent seeds are independent.
+  `grid` ignores the seed.
+- **Sampler.** `bayesian` uses Optuna's GP sampler only when PyTorch can be
+  imported, and constrained multivariate TPE otherwise. Pass `prefer_gp=False` to
+  pin TPE across environments.
+- **What the optimiser sees.** The replicate mean of each metric over
+  QC-passing replicates. A campaign seed does not reach the controller; a
+  simulator's own noise seed belongs in `execution.controller.settings`.
+
 ## Reference adapter: algae-sim
 
 The separate `algae-sim` project provides the `algae-sim-reactor` controller: a
 simulated photobioreactor bank with an integrated OD750 probe, `is_simulated=True`,
 and the simulation advanced from the run's clock. It is what
-`configs/culture-algae-sim.yaml` targets. It follows contract v2 once its adapter is
-migrated; see `STATE.md` (Integrations) for its current pin and
+`configs/culture-algae-sim.yaml` targets. It follows contract v2 (since algae-sim `fe01b0c`); see `STATE.md` (Integrations) for its current pin and
 [ADR 0004](adr/0004-culture-controlled-variables.md) for the agreed device facts. Its
 biology is illustrative and unvalidated.

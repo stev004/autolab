@@ -2,6 +2,64 @@
 
 Newest first. Each entry: decisions · changes (commits) · open threads with resume points · user actions.
 
+## 2026-11-13 — grid_levels for the algae-sim optimiser benchmark; README authorship line
+
+Logged 2026-11-15 04:21 GMT. Agent-built and Steven-reviewed. It was directed by the
+algae-sim session ("Algae-sim repo assessment") through cross-session messages.
+Steven confirmed the merge, the push and the README line directly in this session.
+
+**Decisions (Steven)**
+- Benchmark approved: AutoLab's optimiser vs random vs grid on algae-sim, 20–30 seeds,
+  3 replicates, with best-so-far curves and two pages including limits. The algae-sim
+  session owns the runner.
+- Option (i) approved: an explicit `optimization.grid_levels` setting, in lexicographic
+  order with no shuffle. The benchmark grid is temperature [22,28,34] × light
+  [60,180,400] × ph [6.5,8.0] = 18 points.
+- Merge `780937b` to `main` and push ("Yes, merge and push"). Add the AI-authorship
+  sentence to the README ("Commit and push it").
+
+**Findings (from code; sent to the algae-sim session)**
+- `bayesian` = Optuna 4.9 constrained multivariate TPE (MOTPE for several objectives).
+  It uses GP only if torch is installed, and torch is absent in AutoLab's venv.
+- Per-trial sampler seed = `seed + index`: adjacent campaign seeds share start-up
+  points. This was verified: seed 7's points 2–4 = seed 8's points 1–3. Space seeds
+  ≥ `max_experiments` apart.
+- `random` is uniform over resolution steps (hash-seeded). Start-up is not Sobol or LHS.
+- Before `grid_levels`, a grid enumerated every resolution step: about 2.1M points for
+  the demo config, refused at load.
+- Scoring: `hypervolume_2d` exists, with no 3-D version. Recommended an external
+  3-objective hypervolume with a fixed reference point from declared bounds, plus
+  best-so-far OD.
+- Headless runs: the `CultureCampaignService` Python API (pattern in
+  `tests/e2e/test_optimization_benchmark.py`), with per-experiment results from
+  `optimizer_observations`.
+
+**Changes (commits on `main`, pushed; CI passed on `26bfc8b`, run 43365178603)**
+- `780937b` `optimization.grid_levels`:
+  - config and load-time validation in `src/autonomous_lab/campaigns/config.py`;
+  - wiring in `campaigns/lifecycle.py` (`_grid_levels` → `GridSearchStrategy(levels=)`);
+  - the key is omitted when unset, so existing configs keep their canonical hash
+    (checked);
+  - tests in `tests/e2e/test_culture_campaign.py`: the 18-point grid end to end, and
+    7 load failures.
+  - 350 tests pass.
+- `26bfc8b` README: the AI-authorship sentence, last bullet of "Status and limitations".
+- Closeout: `STATE.md`, `docs/culture.md` (new Optimiser settings section; fixed the
+  stale "once its adapter is migrated" line), and a new doc-map row in
+  `.claude/CLOSEOUT.md`.
+
+**Open threads (resume points)**
+- **Benchmark.** Owner: the algae-sim session, which moves next. It moves algae-sim's
+  pin to `780937b`/`26bfc8b`, then runs the arms. The grid arm has a budget of 18.
+  AutoLab acts only if it asks for another change.
+- **Stage 8 parallel batches.** Still next for AutoLab and unstarted. Scope is in
+  `STATE.md` → Next 1.
+- Merged local branches `stage6-*`, `stage7-agents` and `culture-contract-v2` are
+  still present (`culture-grid-levels` was deleted).
+
+**User actions**
+- None required.
+
 ## 2026-11-11 — Stage 6 complete, stage 7 first slice, culture contract v2; closeout bootstrap
 
 Covers 2026-11-09 → 2026-11-11. Agent-built, Steven-reviewed. It ran alongside the
