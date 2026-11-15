@@ -25,13 +25,8 @@ Updated: 2026-11-15
    - per-experiment journal and resume kept.
 
    Agreed with Steven; not started. algae-sim's reactor bank is the target rig.
-2. **Optimiser benchmark on algae-sim** (Steven approved 2026-11-13). Owner: the algae-sim session, which builds the runner in algae-sim; AutoLab's part (`grid_levels`) is done.
-   - arms: bayesian (Optuna TPE), random, grid `temperature [22,28,34] × light_intensity [60,180,400] × ph [6.5,8.0]`; 20–30 seeds each; 3 replicates;
-   - the grid arm's budget is 18 (its grid size), not 20;
-   - seeds must be spaced ≥ `max_experiments` apart (e.g. 1000·k). See Optimiser settings in `docs/culture.md` for why.
-   AutoLab moves next only if the benchmark needs another change.
-3. Later stage 7 work: a model-backed agent (local model, or an API if affordable) behind `ResearchAgent`, an MCP server, and literature retrieval.
-4. Housekeeping: delete merged local branches (`stage6-*`, `stage7-agents`, `culture-contract-v2`).
+2. Later stage 7 work: a model-backed agent (local model, or an API if affordable) behind `ResearchAgent`, an MCP server, and literature retrieval.
+3. Housekeeping: delete merged local branches (`stage6-*`, `stage7-agents`, `culture-contract-v2`).
 
 ## Blockers
 - None.
@@ -39,7 +34,8 @@ Updated: 2026-11-15
 ## Integrations
 - **algae-sim** (`~/Documents/algae-sim`, GitHub-pinned dependency):
   - provides the `algae-sim-reactor` controller (`autonomous_lab.culture_controllers` entry point; integrated OD750 probe; `is_simulated=True`);
-  - on contract v2 since algae-sim `fe01b0c`. Its pin was `e9f8421`; on 2026-11-13 the algae-sim session was told to move it to `780937b`/`26bfc8b` (same code) for `grid_levels`. Not confirmed from here;
+  - on contract v2 since algae-sim `fe01b0c`; pins AutoLab `26bfc8b` (checked in algae-sim `pyproject.toml`);
+  - optimiser benchmark done (algae-sim `docs/benchmark.md`; 18 experiments × 3 replicates, 30 paired runs, seeds 1000 apart). AutoLab's TPE beat random search by +2.9 % hypervolume (better in 22/30, p < 0.001; no gain in best OD750) and the grid by +13.5 %. Simulator only;
   - per algae-sim's report (2026-11-11; not re-run from AutoLab), `configs/culture-algae-sim.yaml` (20 experiments × 3 reactors; temperature, light, pH; final_od750, energy_kwh, co2_g) runs to completion, and QC failures match its injected faults (control:temperature, growth_plausible, ph_low_trip with control:ph);
   - agreed v2 device facts: temperature 20–36 °C (heating only) with a 39 °C trip; light 0–500; pH 6.0–9.0 at 0.05 with trips at 5.5 and 9.8; resources energy (kWh) and co2 (g); safe state closes the CO2 valve.
 
