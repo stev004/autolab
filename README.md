@@ -27,7 +27,8 @@ uv run autolab campaign report "$CID" --database data/autolab.sqlite3
 
 ## Status and limitations
 
-- Research software, version 0.5. It is not production software.
+- Research software (last tagged release 0.5.0; stages 6 and 7, culture campaigns
+  and the research-agent boundary, landed after it). It is not production software.
 - It runs in simulation, with a human in the loop, and with fixture-backed
   measurements.
 - There are no real hardware drivers yet. The hardware seam is designed
@@ -48,7 +49,7 @@ uv run autolab campaign report "$CID" --database data/autolab.sqlite3
 ## Overview
 
 AutoLab is a local, hardware-agnostic platform for reproducible closed-loop
-experimental optimisation. V0.5 can execute the scientific loop in simulation,
+experimental optimisation. It can execute the scientific loop in simulation,
 pause for a human operator and external measurements, or acquire fixture-backed
 measurements through the same read-only contract intended for a future physical
 sensor. The optimiser cannot see the hidden response surface, and no optimiser or
