@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal, Protocol
@@ -269,7 +270,19 @@ class CultureExperimentRunner:
         qc_config: CultureQCConfig | None = None,
         compiler: CultureProtocolCompiler | None = None,
         on_interrupt: InterruptPolicy = "safe_state",
+        controller_timeout_seconds: float = 60.0,
+        safe_state_timeout_seconds: float = 30.0,
     ) -> None:
+        """Build a runner.
+
+        ``controller_timeout_seconds`` bounds every other controller call
+        (manifest, setpoints, telemetry); ``safe_state_timeout_seconds`` bounds
+        each per-reactor safe-state request. Without a bound, one hung adapter
+        call would stall the run, and with it the safe-state sweep, forever.
+        """
+
+        if controller_timeout_seconds <= 0 or safe_state_timeout_seconds <= 0:
+            raise ValueError("controller timeouts must be positive")
         self.controller = controller
         self.sensor = sensor
         self.clock = clock
@@ -278,6 +291,8 @@ class CultureExperimentRunner:
         self.compiler = compiler or CultureProtocolCompiler()
         self.validator = CultureValidationService(self.compiler)
         self.on_interrupt = on_interrupt
+        self.controller_timeout_seconds = controller_timeout_seconds
+        self.safe_state_timeout_seconds = safe_state_timeout_seconds
 
     # ------------------------------------------------------------------ run
 
@@ -301,7 +316,7 @@ class CultureExperimentRunner:
         except CultureCompilationError as exc:
             audit.to(ExperimentState.REJECTED, "uncompilable proposal")
             return record("rejected", reason=str(exc))
-        capabilities = await self.controller.capability_manifest()
+        capabilities = await self._call(self.controller.capability_manifest(), "manifest")
         validation = self.validator.validate(
             proposal=proposal,
             protocol=protocol,
@@ -421,7 +436,9 @@ class CultureExperimentRunner:
             # Confirm each reactor is still holding *our* command before trusting it.
             for item in unfinished:
                 try:
-                    sample = await self.controller.read_telemetry(item.reactor_id)
+                    sample = await self._call(
+                        self.controller.read_telemetry(item.reactor_id), "telemetry"
+                    )
                 except ControllerError as exc:
                     raise CultureResumeError(
                         f"cannot reach controller to confirm {item.reactor_id} ({exc.code}); "
@@ -544,7 +561,10 @@ class CultureExperimentRunner:
             journal.record("setpoint_command", item.command, reactor_id=item.reactor_id)
             item.sent = True
             try:
-                ack = await self.controller.apply_setpoints(item.command)
+                # A setpoint that times out may still have been applied: ambiguous.
+                ack = await self._call(
+                    self.controller.apply_setpoints(item.command), "setpoint", ambiguous=True
+                )
             except ControllerError as exc:
                 events.append(
                     self._event(
@@ -612,7 +632,7 @@ class CultureExperimentRunner:
         self, item: _Replicate, events: list[RunEvent], journal: CultureRunJournal
     ) -> None:
         try:
-            sample = await self.controller.read_telemetry(item.reactor_id)
+            sample = await self._call(self.controller.read_telemetry(item.reactor_id), "telemetry")
         except ControllerError as exc:
             # Telemetry is read-only; a failed read is a gap, not a hazard.
             events.append(self._event(exc.code, str(exc), reactor_id=item.reactor_id))
@@ -678,9 +698,38 @@ class CultureExperimentRunner:
         events: list[RunEvent],
         journal: CultureRunJournal,
     ) -> None:
-        for item in replicates:
-            if item.sent and not item.safe_requested:
-                await self._safe(item, reason, events, journal)
+        """Request safe state for every reactor that may have received a setpoint.
+
+        The sweep is fault-isolated: whatever goes wrong for one reactor (a
+        controller error of any type, a hung call, a journal write failure), every
+        other reactor still receives its request. Requests go one at a time,
+        because adapters are not required to tolerate concurrent calls, but each
+        is bounded by ``safe_state_timeout_seconds``, so the worst case for the
+        last reactor is ``len(replicates) * timeout``.
+
+        The sweep also runs to the end if this task is cancelled again while it is
+        running (a second Ctrl-C, a shutdown timeout): half a sweep is the one
+        outcome that must not happen. Cancellation is re-raised afterwards.
+
+        A journal failure is re-raised only after every reactor has been asked,
+        because a run whose evidence could not be written must still crash
+        loudly; the device being safe does not make the record complete.
+        """
+
+        targets = [item for item in replicates if item.sent and not item.safe_requested]
+        if not targets:
+            return
+        journal_failures: list[Exception] = []
+
+        async def sweep() -> None:
+            for item in targets:
+                failure = await self._safe(item, reason, events, journal)
+                if failure is not None:
+                    journal_failures.append(failure)
+
+        await _finish_despite_cancellation(asyncio.ensure_future(sweep()))
+        if journal_failures:
+            raise journal_failures[0]
 
     async def _safe(
         self,
@@ -688,33 +737,63 @@ class CultureExperimentRunner:
         reason: str,
         events: list[RunEvent],
         journal: CultureRunJournal,
-    ) -> None:
+    ) -> Exception | None:
+        """Ask one reactor to enter safe state; never raise for a device fault.
+
+        Any failure of the request is recorded as an *ambiguous* event (the
+        device may or may not be safe), which fails the run as
+        ``ambiguous_device_state``. A journal write failure is returned, not
+        raised, so the caller can finish the sweep first.
+        """
+
         item.safe_requested = True
+        acknowledgement: SafeStateAcknowledgement | None = None
         try:
-            acknowledgement = await self.controller.enter_safe_state(item.reactor_id, reason)
-        except ControllerError as exc:
-            events.append(
-                self._event(
-                    exc.code,
-                    f"safe state request failed: {exc}",
-                    ambiguous=True,
-                    reactor_id=item.reactor_id,
-                )
+            acknowledgement = await _bounded(
+                self.controller.enter_safe_state(item.reactor_id, reason),
+                self.safe_state_timeout_seconds,
             )
-            journal.record("event", events[-1], reactor_id=item.reactor_id)
-            return
-        item.safe_state = acknowledgement
-        journal.record("safe_state", acknowledgement, reactor_id=item.reactor_id)
-        if not acknowledgement.reached:
-            events.append(
-                self._event(
+        except TimeoutError:
+            failed = self._event(
+                "safe_state_timeout",
+                f"no safe-state answer within {self.safe_state_timeout_seconds} s",
+                ambiguous=True,
+                reactor_id=item.reactor_id,
+            )
+        except ControllerError as exc:
+            failed = self._event(
+                exc.code,
+                f"safe state request failed: {exc}",
+                ambiguous=True,
+                reactor_id=item.reactor_id,
+            )
+        except Exception as exc:  # adapter code: any fault is ambiguous
+            failed = self._event(
+                "safe_state_error",
+                f"safe state request failed: {exc!r}",
+                ambiguous=True,
+                reactor_id=item.reactor_id,
+            )
+        else:
+            item.safe_state = acknowledgement
+            failed = None
+            if not acknowledgement.reached:
+                failed = self._event(
                     "safe_state_not_reached",
                     acknowledgement.detail or "",
                     ambiguous=True,
                     reactor_id=item.reactor_id,
                 )
-            )
-            journal.record("event", events[-1], reactor_id=item.reactor_id)
+        if failed is not None:
+            events.append(failed)
+        try:
+            if acknowledgement is not None:
+                journal.record("safe_state", acknowledgement, reactor_id=item.reactor_id)
+            if failed is not None:
+                journal.record("event", failed, reactor_id=item.reactor_id)
+        except Exception as exc:  # surfaced by _safe_all after the sweep
+            return exc
+        return None
 
     # --------------------------------------------------------- conclusion
 
@@ -770,6 +849,23 @@ class CultureExperimentRunner:
 
     # -------------------------------------------------------------- helpers
 
+    async def _call[T](self, call: Awaitable[T], operation: str, *, ambiguous: bool = False) -> T:
+        """Await one controller call, bounded; a timeout becomes a ``ControllerError``.
+
+        Converting the timeout lets every caller keep its existing handling: a
+        setpoint timeout is ambiguous (the device may have acted), a telemetry
+        timeout is a gap, and a manifest timeout stops the run before dispatch.
+        """
+
+        try:
+            return await _bounded(call, self.controller_timeout_seconds)
+        except TimeoutError as exc:
+            raise ControllerError(
+                f"{operation}_timeout",
+                f"controller gave no {operation} answer within {self.controller_timeout_seconds} s",
+                ambiguous=ambiguous,
+            ) from exc
+
     def _command(
         self, run_id: UUID, receipt: ExecutableCultureProtocol, spec: CultureReplicate
     ) -> SetpointCommand:
@@ -784,7 +880,7 @@ class CultureExperimentRunner:
         )
 
     async def _stale_receipt(self, receipt: ExecutableCultureProtocol) -> str | None:
-        live = await self.controller.capability_manifest()
+        live = await self._call(self.controller.capability_manifest(), "manifest")
         if live.sha256 != receipt.capability_snapshot_hash:
             return "receipt_stale: controller capabilities changed after validation"
         if self.policy.sha256 != receipt.validation_policy_hash:
@@ -868,6 +964,63 @@ def _record(
         },
         strict=False,
     )
+
+
+async def _bounded[T](call: Awaitable[T], timeout: float) -> T:
+    """Await an adapter call for at most ``timeout`` seconds, then abandon it.
+
+    ``asyncio.wait_for`` is not enough here: after its timeout it cancels the call
+    and then *waits for the call to finish cancelling*, so an adapter that
+    swallows ``CancelledError`` (or keeps awaiting in a ``finally``) would still
+    hang the caller. This asks the call to cancel and moves on.
+
+    Like any asyncio timeout, this bounds only calls that yield to the event
+    loop. A synchronous adapter that blocks the thread (``time.sleep``, a
+    blocking socket read) stops the whole loop and cannot be interrupted from
+    inside it; adapters must do blocking I/O off the loop.
+    """
+
+    task = asyncio.ensure_future(call)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    if not done:
+        task.cancel()
+        # Nobody awaits an abandoned call; retrieve its outcome so asyncio does
+        # not log "exception was never retrieved" when it finally ends.
+        task.add_done_callback(_discard_outcome)
+        raise TimeoutError
+    return task.result()
+
+
+def _discard_outcome[T](task: asyncio.Future[T]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+async def _finish_despite_cancellation(task: asyncio.Future[None]) -> None:
+    """Wait for ``task`` to finish even if we are cancelled meanwhile.
+
+    The same pattern as the assay engine's shielded safe stop
+    (``orchestration/engine.py``): ``asyncio.shield`` keeps the task running when
+    our await is cancelled, and we keep waiting until it is done. Cancellation is
+    re-raised once it is. The task itself is bounded (every call in it has a
+    timeout), so this cannot wait forever.
+    """
+
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            cancelled = True
+    task.result()
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 def _pair(interrupted: InterruptedRun) -> list[tuple[CultureReplicate, ReplicateEvidence]]:

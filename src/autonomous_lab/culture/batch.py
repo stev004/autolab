@@ -4,7 +4,9 @@ A batch round runs several experiments at once, each on its own reactor group, a
 driven through one controller, one sensor and one clock. Adapters are not required
 to tolerate concurrent calls, so AutoLab serialises them here:
 
-- ``SerialController`` puts a lock around every controller call.
+- ``SerialController`` puts a lock around every controller call, except that a
+  safe-state request stops waiting for the lock if another call has held it too
+  long (a hung call must not keep every group from reaching safe state).
 - ``SharedSensor`` keeps one sensor session open for the whole round. A run
   finishing early must not close the probe under the runs still sampling.
 - ``LockstepClock`` lets simulated time advance only once every live run is
@@ -43,11 +45,27 @@ from autonomous_lab.hardware.sensors.errors import SensorError
 
 
 class SerialController:
-    """One call at a time to the wrapped controller."""
+    """One call at a time to the wrapped controller.
 
-    def __init__(self, inner: CultureEnvironmentController) -> None:
+    Safe state outranks serialisation. If a call hangs while holding the lock
+    (the runner abandons it after its timeout, but an adapter that ignores
+    cancellation keeps the lock), every later call would queue behind it, so
+    every group's safe-state sweep would time out without reaching the device.
+    So ``enter_safe_state`` waits at most ``safe_state_lock_wait_seconds`` for the
+    lock and then calls the adapter anyway. By then one-call-at-a-time is already
+    broken by the hung call; a concurrent safe-state request is the lesser risk.
+    The wait must be shorter than the runner's ``safe_state_timeout_seconds`` or
+    the runner gives up first.
+    """
+
+    def __init__(
+        self, inner: CultureEnvironmentController, *, safe_state_lock_wait_seconds: float = 5.0
+    ) -> None:
+        if safe_state_lock_wait_seconds <= 0:
+            raise ValueError("safe_state_lock_wait_seconds must be positive")
         self.inner = inner
         self._lock = asyncio.Lock()
+        self.safe_state_lock_wait_seconds = safe_state_lock_wait_seconds
 
     @property
     def controller_id(self) -> str:
@@ -66,8 +84,15 @@ class SerialController:
             return await self.inner.read_telemetry(reactor_id)
 
     async def enter_safe_state(self, reactor_id: str, reason: str) -> SafeStateAcknowledgement:
-        async with self._lock:
+        try:
+            await asyncio.wait_for(self._lock.acquire(), self.safe_state_lock_wait_seconds)
+        except TimeoutError:
+            # The lock holder is stuck: go around it (see the class docstring).
             return await self.inner.enter_safe_state(reactor_id, reason)
+        try:
+            return await self.inner.enter_safe_state(reactor_id, reason)
+        finally:
+            self._lock.release()
 
 
 class SharedSensor:

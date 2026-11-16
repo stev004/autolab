@@ -1019,7 +1019,9 @@ def test_batch_campaign_resumes_mid_round_and_matches_an_uninterrupted_run(
     asyncio.run(stop_midway())
     assert _count(storage, ExperimentRecord, state=ExperimentState.RUNNING.value) == 3
     controller = rig.controllers[0]
-    assert controller.safe_state_reactors == list(_BANK) * 1  # round 0 ended; round 1 holds
+    # Round 0 ended (each reactor safed exactly once); round 1 holds. The groups'
+    # sweeps run concurrently, so only the multiset is meaningful, not the order.
+    assert sorted(controller.safe_state_reactors) == sorted(_BANK)
 
     status = asyncio.run(service.run(campaign_id))
     assert status.state is CampaignState.COMPLETED and status.valid_observation_count == 9
