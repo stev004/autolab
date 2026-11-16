@@ -97,7 +97,14 @@ def _configure_sqlite(dbapi_connection: Any, _connection_record: Any) -> None:
         # WAL is persistent at the database-file level and improves reader /
         # writer concurrency.  SQLite returns ``memory`` for in-memory DBs.
         cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA synchronous=NORMAL")
+        # FULL, not NORMAL: in WAL mode NORMAL can lose the last commits on power
+        # loss (not on a process crash). The culture journal commits each setpoint
+        # command *before* sending it, so that a restart knows it may be live; if a
+        # power cut rolled that record back, resume would conclude "nothing was
+        # sent" and never request safe state. FULL syncs the WAL on every commit.
+        # The cost is one fsync per commit, negligible at AutoLab's write rate
+        # (a few commits per sample point, minutes apart on real hardware).
+        cursor.execute("PRAGMA synchronous=FULL")
     finally:
         cursor.close()
 
@@ -110,4 +117,6 @@ def sqlite_pragmas(engine: Engine) -> dict[str, int | str]:
             "foreign_keys": connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one(),
             "journal_mode": connection.exec_driver_sql("PRAGMA journal_mode").scalar_one(),
             "busy_timeout": connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one(),
+            # 0 OFF, 1 NORMAL, 2 FULL, 3 EXTRA.
+            "synchronous": connection.exec_driver_sql("PRAGMA synchronous").scalar_one(),
         }

@@ -1,7 +1,18 @@
 # Provenance and persistence
 
 SQLite is the V0 system of record. WAL mode, foreign keys and explicit transactions
-are enabled. Alembic owns schema evolution; `autolab init` creates the current schema
+are enabled.
+
+**Durability: `synchronous=FULL`.** In WAL mode, `NORMAL` survives a process crash
+but can lose the last commits on a power cut. That matters for one record above
+all: the culture runner journals each setpoint command *before* sending it, so a
+restart knows the command may be live. If a power cut rolled that record back,
+resume would conclude that nothing was sent and would never request safe state.
+`FULL` syncs the WAL on every commit, at the cost of one fsync per commit. AutoLab
+commits a few times per sample point, minutes apart on real hardware, so the cost
+is negligible. Raising durability only around the pre-send record was considered
+and rejected: SQLite sets `synchronous` per connection, and switching it per write
+through a connection pool is easy to get wrong for no measurable gain. Alembic owns schema evolution; `autolab init` creates the current schema
 for a new local database.
 
 The evidence chain includes campaigns, objective and parameter snapshots,

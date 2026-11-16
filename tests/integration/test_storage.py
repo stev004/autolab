@@ -437,6 +437,8 @@ def test_sqlite_pragmas_foreign_keys_and_wal(database: Database) -> None:
     assert pragmas["foreign_keys"] == 1
     assert pragmas["journal_mode"] == "wal"
     assert pragmas["busy_timeout"] == 5000
+    # FULL: a power cut must not roll back the pre-send setpoint journal record.
+    assert pragmas["synchronous"] == 2
 
     with pytest.raises(IntegrityError), UnitOfWork(database) as uow:
         uow.experiments.add(
