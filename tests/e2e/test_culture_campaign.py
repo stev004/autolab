@@ -1108,7 +1108,6 @@ def _artifact_records(storage: Storage) -> list[dict[str, Any]]:
     return [json.loads(Path(urlparse(uri).path).read_text(encoding="utf-8")) for uri in uris]
 
 
-
 def test_a_protection_trip_during_the_outage_stops_the_hold_at_once_on_resume(
     tmp_path: Path,
 ) -> None:
@@ -1216,7 +1215,6 @@ def test_a_process_killed_mid_dispatch_is_made_safe_on_the_next_run(
     assert controller.safe_state_calls == ["resume after interrupted dispatch"]
     assert status.state is CampaignState.PAUSED
     assert status.execution_failed_count == 1
-
 
 
 def test_every_failure_in_a_batch_round_is_reported_not_only_the_first(
