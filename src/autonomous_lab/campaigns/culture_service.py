@@ -846,8 +846,8 @@ class CultureCampaignService:
                     "culture execution failed in this batch round; see the failed experiments"
                 ]
                 self.ledger.pause(campaign_id, optimizer_run_id, reason="; ".join(reasons))
-        for item in failures:
-            raise item
+        if failures:
+            raise _first_with_the_rest_noted(failures)
         return not stopped
 
     def _add_proposals(self, proposals: Sequence[ExperimentProposal]) -> None:
@@ -1352,6 +1352,23 @@ class _StorageJournal:
             )
             uow.commit()
         self.sequence += 1
+
+
+def _first_with_the_rest_noted(failures: Sequence[BaseException]) -> BaseException:
+    """The exception to raise for a round in which several members failed.
+
+    Raising an ``ExceptionGroup`` would change the exception type every caller
+    (and the CLI) catches, so the first failure is raised as before and each
+    other failure is attached to it as a note, which tracebacks print. A
+    cancellation or interrupt is raised in preference to an ordinary error, so
+    Ctrl-C is never masked by a failure it caused.
+    """
+
+    ordered = sorted(failures, key=lambda item: isinstance(item, Exception))
+    first, *others = ordered
+    for other in others:
+        first.add_note(f"another member of this batch round also failed: {other!r}")
+    return first
 
 
 def _apply(uow: UnitOfWork, transition: StateTransition) -> None:

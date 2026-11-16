@@ -1217,3 +1217,22 @@ def test_a_process_killed_mid_dispatch_is_made_safe_on_the_next_run(
     assert status.state is CampaignState.PAUSED
     assert status.execution_failed_count == 1
 
+
+
+def test_every_failure_in_a_batch_round_is_reported_not_only_the_first(
+    tmp_path: Path,
+) -> None:
+    """Audit: ``_concurrently`` used to re-raise the first failure and drop the rest."""
+
+    rig = _bank_rig()
+    rig.sensor_fault = RuntimeError("adapter bug")  # every group's first reading fails
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    _, service = _service(tmp_path, rig)
+    campaign_id = service.create(
+        load_culture_campaign(_write(tmp_path, _batch_document())), campaign_id=_BATCH_CAMPAIGN
+    )
+    with pytest.raises(RuntimeError, match="adapter bug") as raised:
+        asyncio.run(service.run(campaign_id))
+    notes = getattr(raised.value, "__notes__", [])
+    assert len(notes) == 2
+    assert all("also failed" in note and "adapter bug" in note for note in notes)

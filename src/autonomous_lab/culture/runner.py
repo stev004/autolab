@@ -452,9 +452,13 @@ class CultureExperimentRunner:
                     ) from exc
                 item.telemetry.append(sample)
                 journal.record("telemetry", sample, reactor_id=item.reactor_id)
-                assert item.acknowledgement is not None
+                # ``active`` implies an accepted acknowledgement, but this is a safety
+                # check, so it must not rest on an ``assert`` (stripped under -O): a
+                # missing acknowledgement counts as "not holding our command".
+                acknowledged = item.acknowledgement
                 if (
-                    sample.active_command_id != item.acknowledgement.command_id
+                    acknowledged is None
+                    or sample.active_command_id != acknowledged.command_id
                     or sample.protection_tripped
                 ):
                     item.hold_interrupted = True
