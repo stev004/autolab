@@ -50,6 +50,7 @@ from autonomous_lab.campaigns.lifecycle import (
     transition_experiment_row,
 )
 from autonomous_lab.campaigns.loader import LoadedCultureCampaign
+from autonomous_lab.campaigns.writer_lock import campaign_writer_lock
 from autonomous_lab.culture import (
     CultureClock,
     CultureControllerCapabilities,
@@ -225,10 +226,20 @@ class CultureCampaignService:
 
         ``max_new_experiments`` is an operator pause hook; it does not change the
         scientific budget in the campaign document.
+
+        Holds the campaign's writer lock throughout, so a second ``run`` while
+        this one is live raises ``CampaignLockedError`` instead of mistaking the
+        live experiment for an interrupted one and driving its reactors too.
         """
 
         if max_new_experiments is not None and max_new_experiments < 1:
             raise ValueError("max_new_experiments must be positive")
+        with campaign_writer_lock(self.storage, campaign_id):
+            return await self._run_locked(campaign_id, max_new_experiments)
+
+    async def _run_locked(
+        self, campaign_id: UUID, max_new_experiments: int | None
+    ) -> CampaignStatus:
         campaign, optimizer_run, checkpoint = self.ledger.load(campaign_id)
         config = culture_config(campaign)
         if CampaignState(campaign.state) is CampaignState.COMPLETED:
@@ -319,7 +330,11 @@ class CultureCampaignService:
 
         if not operator.strip() or not reason.strip():
             raise ValueError("operator and reason are required to reconcile a culture")
-        with self.storage.unit_of_work() as uow:
+        # A live run must not have its experiment closed under it.
+        with (
+            campaign_writer_lock(self.storage, campaign_id),
+            self.storage.unit_of_work() as uow,
+        ):
             experiment = uow.experiments.get(str(experiment_id))
             if experiment.campaign_id != str(campaign_id):
                 raise CampaignExecutionError("experiment does not belong to this campaign")

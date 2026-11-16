@@ -12,6 +12,7 @@ __pycache__/
 *.py[cod]
 *.sqlite
 *.sqlite3
+*.sqlite3.locks/
 
 data/raw/*
 !data/raw/.gitkeep

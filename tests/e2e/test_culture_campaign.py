@@ -1058,3 +1058,39 @@ def test_assay_campaigns_refuse_batches(tmp_path: Path) -> None:
     path.write_text(yaml.safe_dump(document), encoding="utf-8")
     with pytest.raises(ConfigurationLoadError, match="batch_size must be 1"):
         load_campaign(path)
+
+
+def test_a_second_run_on_a_live_campaign_refuses_instead_of_resuming_it(
+    tmp_path: Path,
+) -> None:
+    """Audit finding: a second ``culture run`` used to "resume" the live run."""
+
+    from autonomous_lab.campaigns.writer_lock import CampaignLockedError
+
+    rig = ScriptedRig(reuse_controller=True)
+    clock = SteppedClock(START)
+    storage, service = _service(tmp_path, rig, clock=clock)
+    campaign_id = service.create(load_culture_campaign(_write(tmp_path, _document())))
+    # A second AutoLab process: its own engine and service on the same database file.
+    _, intruder = _service(tmp_path, rig, clock=clock)
+
+    async def race() -> object:
+        first = asyncio.ensure_future(service.run(campaign_id))
+        while clock.now() < START + timedelta(hours=3):  # mid-hold of experiment 1
+            await asyncio.sleep(0)
+        with pytest.raises(CampaignLockedError, match="already being run"):
+            await intruder.run(campaign_id)
+        with storage.unit_of_work() as uow:
+            live = UUID(uow.experiments.list_for_campaign(str(campaign_id))[0].id)
+        with pytest.raises(CampaignLockedError):
+            intruder.reconcile(campaign_id, live, operator="steven", reason="wrong campaign")
+        return await first
+
+    status = asyncio.run(race())
+    assert isinstance(status, type(service.status(campaign_id)))
+    assert status.state is CampaignState.COMPLETED
+    # The intruder never touched the rig: one setpoint per reactor per experiment.
+    assert len(rig.controllers[0].commands) == 4
+    assert _count(storage, ExperimentRecord, state=ExperimentState.OBSERVED.value) == 4
+    # The lock is released at the end, so a later run is allowed (and is a no-op).
+    assert asyncio.run(intruder.run(campaign_id)).state is CampaignState.COMPLETED
