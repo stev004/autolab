@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import math
 import warnings
@@ -31,6 +32,12 @@ from autonomous_lab.optimization.interface import (
 
 _CONSTRAINTS_ATTRIBUTE = "autolab_constraint_residuals"
 _PARAMETERS_ATTRIBUTE = "autolab_executed_parameter_values"
+#: Per-trial sampler seeds are a hash of (campaign seed, trial index).
+SEED_SCHEME = "sha256-v1"
+#: Strategy version 1.1.0 and earlier: ``(seed + index) % 2**32``. Kept only so a
+#: campaign checkpointed under it replays the trials it actually ran.
+LEGACY_SEED_SCHEME = "offset-v0"
+_SEED_SCHEMES = frozenset({SEED_SCHEME, LEGACY_SEED_SCHEME})
 
 
 class OptunaReconciliationError(ValueError):
@@ -57,7 +64,7 @@ class OptunaStrategy(OptimizationStrategy):
     """
 
     strategy_name = "bayesian"
-    strategy_version = "1.1.0"
+    strategy_version = "1.2.0"
 
     def __init__(
         self,
@@ -97,8 +104,12 @@ class OptunaStrategy(OptimizationStrategy):
         self._orphaned_native_trials: set[int] = set()
         self._locally_sampled_trials: set[int] = set()
         self._sampler_reconstructed = False
+        self.sampler_seed_scheme = self._restored_seed_scheme(restored_state)
         sampler, sampler_name = self._select_sampler(
-            self._sampler_seed(seed, 0), startup_experiments, prefer_gp, batch_size
+            self._sampler_seed(seed, 0, self.sampler_seed_scheme),
+            startup_experiments,
+            prefer_gp,
+            batch_size,
         )
         self.sampler_name = sampler_name
         directions = [metric.direction.value for metric in problem.objective_metrics]
@@ -500,7 +511,7 @@ class OptunaStrategy(OptimizationStrategy):
 
     def _sampler_for_trial(self, suggestion_index: int) -> BaseSampler:
         sampler, sampler_name = self._select_sampler(
-            self._sampler_seed(self.seed, suggestion_index),
+            self._sampler_seed(self.seed, suggestion_index, self.sampler_seed_scheme),
             self.startup_experiments,
             self.sampler_name == "optuna_gp",
             self.batch_size,
@@ -512,8 +523,35 @@ class OptunaStrategy(OptimizationStrategy):
         return sampler
 
     @staticmethod
-    def _sampler_seed(seed: int, suggestion_index: int) -> int:
-        return (seed + suggestion_index) % (2**32)
+    def _sampler_seed(seed: int, suggestion_index: int, scheme: str = SEED_SCHEME) -> int:
+        """The sampler seed for one trial.
+
+        The old scheme, ``seed + index``, made campaign seed 11 replay seed 10's
+        start-up design shifted by one trial, because (11, i) and (10, i + 1) got
+        the same sampler seed. Hashing the pair gives every (seed, index) its own
+        well-mixed 32-bit seed, with no structure shared between campaigns.
+        """
+
+        if scheme == LEGACY_SEED_SCHEME:
+            return (seed + suggestion_index) % (2**32)
+        digest = hashlib.sha256(f"autolab:optuna-sampler:{seed}:{suggestion_index}".encode())
+        return int.from_bytes(digest.digest()[:4], "big")
+
+    @staticmethod
+    def _restored_seed_scheme(restored_state: OptimizationState | None) -> str:
+        """New campaigns use the current scheme; checkpoints say which they used.
+
+        A checkpoint written before the scheme was recorded used the legacy one.
+        An unknown scheme fails closed rather than replaying different trials.
+        """
+
+        if restored_state is None:
+            return SEED_SCHEME
+        data = restored_state.checkpoint_data
+        scheme = str(data.get("sampler_seed_scheme", LEGACY_SEED_SCHEME))
+        if scheme not in _SEED_SCHEMES:
+            raise ValueError(f"unknown Optuna sampler seed scheme {scheme!r} in checkpoint")
+        return scheme
 
     def _audit_replayed_proposal(
         self, replayed: Mapping[str, QuantityValue], record: TrialRecord
@@ -777,6 +815,7 @@ class OptunaStrategy(OptimizationStrategy):
         return {
             "study_name": self.study_name,
             "sampler_name": self.sampler_name,
+            "sampler_seed_scheme": self.sampler_seed_scheme,
             "optuna_trial_count": len(self.study.trials),
             "storage_is_persistent": self.storage_url is not None,
             "orphaned_native_trials": sorted(self._orphaned_native_trials),

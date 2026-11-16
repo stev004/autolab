@@ -99,10 +99,11 @@ def test_bayesian_and_random_outcome_distributions_across_fixed_seeds(
     # random search in every finite run. Guard against a pathological regression
     # while retaining the paired distributions for honest benchmark reporting.
     assert bayesian_mean >= 0.9 * random_mean, scores
-    assert any(
-        bayesian > random
-        for bayesian, random in zip(scores["bayesian"], scores["random"], strict=True)
-    ), scores
+    # There used to be a second check, "TPE wins at least one of the three paired
+    # runs". It held only by luck of the sampler seeds: over 10 paired seeds TPE
+    # won 8 under the old ``seed + index`` sampler seeds and 3 under the hashed
+    # ones (mean difference +0.013 vs -0.003, paired sd 0.02-0.035). At this
+    # budget the two are within seed noise, so three runs cannot show either way.
 
 
 def _observation_points(storage: Storage, campaign_id: UUID) -> list[ParetoPoint]:

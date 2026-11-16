@@ -393,7 +393,9 @@ def _trial_snapshots(
     return snapshots
 
 
-def _native_trial_data(record: TrialRecord) -> tuple[
+def _native_trial_data(
+    record: TrialRecord,
+) -> tuple[
     dict[str, float],
     dict[str, FloatDistribution],
     list[float],
@@ -418,9 +420,7 @@ def _native_trial_data(record: TrialRecord) -> tuple[
         "autolab_executed_parameter_values": {
             name: str(value.value) for name, value in proposal.parameter_values.items()
         },
-        "autolab_constraint_residuals": [
-            float(observation.constraint_residuals["cv"])
-        ],
+        "autolab_constraint_residuals": [float(observation.constraint_residuals["cv"])],
     }
     return params, distributions, values, attrs
 
@@ -589,3 +589,65 @@ def test_pending_proposals_outside_the_final_round_are_refused(tmp_path) -> None
     del strategy
     with pytest.raises(OptunaReconciliationError, match="final round"):
         _batch_strategy(problem, url).reconcile_pending_batch(records, [round_one[0]])
+
+
+def _startup_design(seed: int, count: int = 7) -> list[tuple[tuple[str, Decimal], ...]]:
+    strategy = OptunaStrategy(
+        campaign_id=UUID("2b0f7f0e-2d0c-4a43-9d3e-1d2a7d0c9a11"),
+        problem=_problem(),
+        seed=seed,
+        startup_experiments=count,
+        prefer_gp=False,
+    )
+    return [_parameter_snapshot(record) for record in _run_trials(strategy, count)]
+
+
+def test_adjacent_campaign_seeds_do_not_share_their_startup_design() -> None:
+    """Audit: with ``seed + index`` seed 11 replayed seed 10's design shifted by one."""
+
+    ten, eleven = _startup_design(10), _startup_design(11)
+    assert not set(ten) & set(eleven)
+    assert _startup_design(10) == ten  # still reproducible
+
+
+def test_sampler_seeds_are_derived_by_hashing_not_by_offset() -> None:
+    seeds = {OptunaStrategy._sampler_seed(seed, index) for seed in range(20) for index in range(20)}  # pyright: ignore[reportPrivateUsage]
+    assert len(seeds) == 400  # (seed, index) pairs no longer alias each other
+    assert all(0 <= seed < 2**32 for seed in seeds)
+
+
+def test_campaigns_checkpointed_before_the_change_keep_their_legacy_seeds() -> None:
+    """Resuming an older campaign must replay the trials it actually ran."""
+
+    campaign_id = uuid4()
+    legacy = OptunaStrategy(
+        campaign_id=campaign_id,
+        problem=_problem(),
+        seed=10,
+        startup_experiments=5,
+        prefer_gp=False,
+    )
+    state = legacy.checkpoint()
+    old_data = dict(state.checkpoint_data)
+    old_data.pop("sampler_seed_scheme")  # as written by strategy version 1.1.0
+    restored = OptunaStrategy(
+        campaign_id=campaign_id,
+        problem=_problem(),
+        seed=10,
+        startup_experiments=5,
+        prefer_gp=False,
+        restored_state=state.model_copy(update={"checkpoint_data": old_data}),
+    )
+    assert restored.sampler_seed_scheme == "offset-v0"
+    assert restored.checkpoint().checkpoint_data["sampler_seed_scheme"] == "offset-v0"
+    assert legacy.sampler_seed_scheme == "sha256-v1"
+    with pytest.raises(ValueError, match="seed scheme"):
+        OptunaStrategy(
+            campaign_id=campaign_id,
+            problem=_problem(),
+            seed=10,
+            prefer_gp=False,
+            restored_state=state.model_copy(
+                update={"checkpoint_data": {**old_data, "sampler_seed_scheme": "unknown"}}
+            ),
+        )

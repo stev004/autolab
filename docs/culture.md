@@ -390,7 +390,10 @@ culture_design: {reactor_ids: [r1, r2, r3, r4, r5, r6, r7, r8, r9], minimum_pass
   - TPE uses `constant_liar` for batches only, which works with several
     objectives and constraints in Optuna 4.9. GP conditions on running trials
     natively. Random and grid are unaffected.
-  - The per-trial seed is still `seed + ordinal`.
+  - The per-trial sampler seed is a SHA-256 hash of `(seed, ordinal)`. It used to
+    be `seed + ordinal`, which made campaign seed *s + 1* replay seed *s*'s
+    start-up design shifted by one trial. Campaigns checkpointed before the change
+    keep the old scheme when resumed (`sampler_seed_scheme` in the checkpoint).
   - Random start-up runs until `startup_experiments` trials are *complete* when a
     round is asked, so it extends to a round boundary. With startup 8 and k = 3,
     9 proposals are random.
