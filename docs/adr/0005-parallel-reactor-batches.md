@@ -75,11 +75,17 @@ wrappers. Neither requires an adapter change.
 
 - **Serialised controller:** a per-controller `asyncio.Lock` around every call.
   Adapters are not required to be safe under concurrent calls, and the calls are
-  short (apply, telemetry, safe state).
-- **Shared sensor session:** a reference-counted wrapper. `open()` opens on the
-  first runner and `close()` closes after the last one, so one group finishing
-  doesn't close the sensor under the others. Reads and self-tests go through the
-  same lock.
+  short (apply, telemetry, safe state). One exception was added after an external
+  audit: `enter_safe_state` waits at most 5 s for the lock and then calls the
+  adapter anyway, so one hung call holding the lock cannot keep every group from
+  reaching safe state. (Every runner call is also bounded by a timeout.)
+- **Shared sensor session:** a round-scoped wrapper, *not* reference-counted
+  (an earlier draft of this ADR said it was). The first `open()` opens the real
+  sensor and later ones reuse that session. A runner's `close()` is a no-op while
+  the session is open, and the round owner closes it once, with
+  `close_session()`, after every runner has ended. So one group finishing doesn't
+  close the sensor under the others. If no session is open, `close()` passes
+  through to the sensor. Reads and self-tests go through the same lock.
 - **Simulated clock:** `SteppedClock` currently jumps time forward on any
   `sleep_until`. With k concurrent runners, one runner could jump past another's
   sample time. In batch mode the stepped clock becomes a barrier: it advances to

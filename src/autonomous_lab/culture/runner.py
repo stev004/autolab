@@ -11,12 +11,21 @@ Execution order for one experiment::
       -> apply setpoints to every replicate reactor (each acknowledged)
       -> until the hold ends: telemetry every telemetry_interval per reactor,
                               one OD reading per reactor per plan entry
-      -> request safe state (per reactor, on every exit path*), close sensor
+      -> request safe state (per reactor, on every exit path the process lives
+         through*), close sensor
       -> reconcile time series -> per-replicate QC -> replicate rule -> analysis
 
-\\* Except a deliberate detach: with ``on_interrupt="keep_holding"`` a cancelled
-run (Ctrl-C, process shutdown) leaves the device holding under its own local
-control and protection, and ``resume`` picks the hold up later.
+\\* "Every exit path the process lives through" means the hold ending, a refusal,
+an exception or a cancellation. The safe-state sweep is fault-isolated and every
+controller call is bounded, so one reactor's fault, a journal failure or a hung
+call cannot stop the others being asked (see ``_safe_all``). Two exceptions:
+
+- a deliberate detach: with ``on_interrupt="keep_holding"`` a cancelled run
+  (Ctrl-C, process shutdown) leaves the device holding under its own local
+  control and protection, and ``resume`` picks the hold up later;
+- the process being killed or the host losing power: no code runs. The
+  device's local protection holds the line, and ``resume`` requests safe state
+  for every reactor whose command was journalled before sending.
 
 Long-running state: every command, acknowledgement, telemetry sample, reading
 and safe-state result is passed to an optional ``CultureRunJournal`` as it
@@ -352,7 +361,8 @@ class CultureExperimentRunner:
             return record("failed", reason=not_ready, **common)
         sensor_capabilities = not_ready
 
-        # 4. Execute. Safe state and sensor close happen on every exit path.
+        # 4. Execute. _execute requests safe state and closes the sensor in a
+        # ``finally``, so on every exit path this process survives (see top).
         audit.to(ExperimentState.RUNNING)
         header = DispatchHeader(
             run_id=uuid5(NAMESPACE_URL, f"autolab:culture-run:{protocol.experiment_id}"),

@@ -8,7 +8,10 @@ following ``docs/hardware-interface.md``:
 - every command is acknowledged with the values the device actually applied;
 - the device reports telemetry it can attest to (measured temperature, protection
   trips, energy) and nothing it cannot;
-- ``enter_safe_state`` is always available and is called on every exit path.
+- ``enter_safe_state`` is always available. The runner requests it on every exit
+  path the AutoLab process survives, with a timeout; it cannot when the process
+  is killed or the host loses power, which is why local protection (below) is
+  the device's job.
 
 Local protection (for example an over-temperature trip) belongs to the device and
 keeps working with AutoLab disconnected. AutoLab only reads whether it fired.

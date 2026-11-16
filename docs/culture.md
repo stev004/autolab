@@ -184,8 +184,20 @@ physical world, so it has more obligations than `ReadOnlySensor`:
   `active_command_id`, the command it is holding; without it AutoLab cannot resume
   a hold after a restart and can only end it safely.
 - `enter_safe_state` is requested for every reactor that may have received a
-  setpoint, on every exit path except a deliberate detach (below). If safe state is
-  not confirmed, the run fails as `ambiguous_device_state`.
+  setpoint, on every exit path the AutoLab process lives through (the hold ends,
+  a refusal, an error, Ctrl-C), except a deliberate detach (below). If safe state
+  is not confirmed, the run fails as `ambiguous_device_state`.
+  - The sweep is fault-isolated: any fault on one reactor (an exception of any
+    type, a timeout, a journal write failure) never stops the others being asked.
+    A journal failure is re-raised once every reactor has been asked.
+  - Every controller call is bounded: 60 s for manifest, setpoint and telemetry
+    calls, and 30 s per safe-state request. A hung call is abandoned, not awaited.
+    A setpoint timeout is ambiguous, and a telemetry timeout is a gap.
+  - A second Ctrl-C during the sweep does not cut it short.
+  - What no software can cover: if the process is killed or the host loses power,
+    no sweep runs. The device's own local protection holds the line, and the
+    next `culture run` finds the journalled command and requests safe state
+    before anything else (see recovery below).
 - A `ControllerError` with `ambiguous=True` (the device may have acted) is never
   retried. Read-only telemetry failures are recorded as gaps.
 - Local protection, such as an over-temperature trip, belongs to the device and must
@@ -370,7 +382,9 @@ culture_design: {reactor_ids: [r1, r2, r3, r4, r5, r6, r7, r8, r9], minimum_pass
   after the rest of the round has finished and been told.
 - **Shared rig.** AutoLab serialises controller and sensor calls with a lock and
   keeps one sensor session open per round, so adapters need not tolerate
-  concurrent calls. Under `clock: simulated`, time advances only once every
+  concurrent calls. The one exception is safe state: a safe-state request waits
+  at most 5 s for the lock, then goes around it, so a hung call cannot block
+  every group's sweep. Under `clock: simulated`, time advances only once every
   running group is waiting.
 - **Optimiser.**
   - TPE uses `constant_liar` for batches only, which works with several

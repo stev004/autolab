@@ -27,6 +27,9 @@ A physical adapter must:
   physical state;
 - make idempotency behavior explicit and never silently repeat a liquid movement;
 - implement a best-effort safe state without preventing other devices from stopping;
+- keep async calls cooperative: do blocking I/O off the event loop and honour
+  cancellation. AutoLab bounds every culture-controller call with a timeout, and a
+  call that blocks the event loop thread cannot be interrupted by any timeout;
 - expose firmware/adapter version and current calibration metadata;
 - return actual executed quantities when they can differ from requested quantities;
 - contribute only the evidence fragment it can directly attest to: liquid handlers

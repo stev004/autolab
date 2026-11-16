@@ -98,8 +98,11 @@ class SerialController:
 class SharedSensor:
     """One sensor session for a whole round; calls are serialised.
 
-    ``open`` opens the real sensor only if it is closed. ``close`` from a run is a
-    no-op: the round owner calls :meth:`close_session` once every run has ended.
+    This is round-scoped, not reference-counted. ``open`` opens the real sensor
+    only if no session is open, and otherwise returns the existing session.
+    ``close`` from a run is a no-op while that session is open; the round owner
+    calls :meth:`close_session` once, after every run has ended. If no session
+    was ever opened through this wrapper, ``close`` passes through to the sensor.
     """
 
     def __init__(self, inner: ReadOnlySensor) -> None:
