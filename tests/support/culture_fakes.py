@@ -176,6 +176,8 @@ class ScriptedController:
     #: measured pH - setpoint pH (only used when the device controls ph).
     ph_error: Callable[[Decimal], Decimal | None] = lambda _h: Decimal("0.02")
     trip_after_hours: Decimal | None = None
+    #: Reactors that trip at ``trip_after_hours``; None means every reactor.
+    trip_reactors: frozenset[str] | None = None
     applied_temperature_override: QuantityValue | None = None
     power_kw: Decimal = Decimal("0.05")
     co2_g_per_hour: Decimal = Decimal("0.5")
@@ -259,7 +261,11 @@ class ScriptedController:
             raise self.telemetry_failure
         command = self.applied[reactor_id]
         elapsed = Decimal(str((self.clock.now() - self.started[reactor_id]).total_seconds())) / 3600
-        tripped = self.trip_after_hours is not None and elapsed >= self.trip_after_hours
+        tripped = (
+            self.trip_after_hours is not None
+            and elapsed >= self.trip_after_hours
+            and (self.trip_reactors is None or reactor_id in self.trip_reactors)
+        )
         measured: dict[str, QuantityValue | None] = {}
         error = self.temperature_error(elapsed)
         if error is not None:

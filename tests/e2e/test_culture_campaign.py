@@ -1094,3 +1094,126 @@ def test_a_second_run_on_a_live_campaign_refuses_instead_of_resuming_it(
     assert _count(storage, ExperimentRecord, state=ExperimentState.OBSERVED.value) == 4
     # The lock is released at the end, so a later run is allowed (and is a no-op).
     assert asyncio.run(intruder.run(campaign_id)).state is CampaignState.COMPLETED
+
+
+# ------------------------------------------------------------------------------
+# Resume edge cases. Each kills a mutant that survived the whole suite in an
+# external audit (named in the docstring).
+
+
+def _artifact_records(storage: Storage) -> list[dict[str, Any]]:
+    with storage.unit_of_work() as uow:
+        assert uow.session is not None
+        uris = list(uow.session.scalars(select(ArtifactRecord.uri)))
+    return [json.loads(Path(urlparse(uri).path).read_text(encoding="utf-8")) for uri in uris]
+
+
+
+def test_a_protection_trip_during_the_outage_stops_the_hold_at_once_on_resume(
+    tmp_path: Path,
+) -> None:
+    """M1: resume must not trust a hold whose device protection has tripped."""
+
+    storage, service, rig, clock, campaign_id = _interrupted_campaign(tmp_path)
+    controller = rig.controllers[0]
+    controller.trip_after_hours = Decimal(13)  # tripped while AutoLab was down
+    asyncio.run(clock.sleep_until(START + timedelta(hours=14)))
+    asyncio.run(service.run(campaign_id))
+
+    # Made safe on resume itself, not left holding until the next telemetry poll.
+    assert controller.safe_state_calls[0] == "hold not confirmed after restart"
+    (resumed,) = [item for item in _artifact_records(storage) if item["evidence"]["resumed_at"]]
+    assert resumed["evidence"]["replicates"][0]["hold_interrupted"] is True
+    assert "hold_not_confirmed" in {event["code"] for event in resumed["evidence"]["events"]}
+
+
+def test_journal_replay_remembers_a_protection_trip(tmp_path: Path) -> None:
+    """M8: a reactor that tripped before the restart stays stopped in the evidence."""
+
+    document = _document()
+    document["culture_design"] = {
+        **document["culture_design"],
+        "reactor_ids": ["reactor-1", "reactor-2"],
+        "minimum_passing_replicates": 1,
+    }
+    document["campaign"] = {**document["campaign"], "max_experiments": 1}
+    document["optimization"] = {"strategy": "random", "startup_experiments": 1}
+    document["execution"] = {**document["execution"], "on_interrupt": "keep_holding"}
+    rig = ScriptedRig(
+        controller_kwargs={
+            "trip_after_hours": Decimal(2),
+            "trip_reactors": frozenset({"reactor-1"}),
+        },
+        sensor_fault=asyncio.CancelledError(),
+        fault_after_reads=1,  # Ctrl-C at reactor-2's 12 h reading
+        reuse_controller=True,
+    )
+    clock = SteppedClock(START)
+    storage, service = _service(tmp_path, rig, clock=clock)
+    campaign_id = service.create(load_culture_campaign(_write(tmp_path, document)))
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(service.run(campaign_id))
+    rig.sensor_fault = None
+    asyncio.run(service.run(campaign_id))
+
+    (record,) = _artifact_records(storage)
+    replicates = {item["reactor_id"]: item for item in record["evidence"]["replicates"]}
+    assert replicates["reactor-1"]["stopped_early"] is True
+    assert replicates["reactor-2"]["stopped_early"] is False
+
+
+def test_a_reading_whose_window_closed_during_the_outage_is_missing_not_late(
+    tmp_path: Path,
+) -> None:
+    """M10: AutoLab must not take a reading after its window closed."""
+
+    storage, service, _rig, clock, campaign_id = _interrupted_campaign(tmp_path)
+    # Stopped at the 12 h reading; back an hour later, long after its 10-minute window.
+    asyncio.run(clock.sleep_until(clock.now() + timedelta(hours=1)))
+    asyncio.run(service.run(campaign_id))
+
+    # Experiment 1 has its 6, 18 and 24 h readings only; the other three have four.
+    assert _count(storage, ActionEventRecord, event_type="reading") == 3 + 3 * 4
+    entries = [
+        entry["status"]
+        for record in _artifact_records(storage)
+        if record["evidence"]["resumed_at"]
+        for entry in record["reconciliations"][0]["entries"]
+    ]
+    assert entries == ["matched", "missing", "matched", "matched"]
+
+
+class _ProcessKilled(BaseException):
+    """Stands in for SIGKILL or a power cut: nothing after it runs."""
+
+
+def test_a_process_killed_mid_dispatch_is_made_safe_on_the_next_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M2 end to end: the journalled command is the only sign it may have been sent."""
+
+    rig = ScriptedRig(reuse_controller=True)
+    storage, service = _service(tmp_path, rig)
+    campaign_id = service.create(load_culture_campaign(_write(tmp_path, _document())))
+
+    async def killed_while_sending(_self: object, _command: object) -> object:
+        raise _ProcessKilled
+
+    async def no_cleanup(*_args: object, **_kwargs: object) -> None:
+        return None  # a killed process runs no safe-state sweep
+
+    with monkeypatch.context() as patch:
+        patch.setattr(culture_service_module.CultureExperimentRunner, "_safe_all", no_cleanup)
+        patch.setattr(ScriptedController, "apply_setpoints", killed_while_sending)
+        with pytest.raises(_ProcessKilled):
+            asyncio.run(service.run(campaign_id))
+    controller = rig.controllers[0]
+    assert controller.safe_state_calls == []
+    assert _count(storage, ActionEventRecord, event_type="setpoint_command") == 1
+    assert _count(storage, ActionEventRecord, event_type="setpoint_ack") == 0
+
+    status = asyncio.run(service.run(campaign_id))
+    assert controller.safe_state_calls == ["resume after interrupted dispatch"]
+    assert status.state is CampaignState.PAUSED
+    assert status.execution_failed_count == 1
+

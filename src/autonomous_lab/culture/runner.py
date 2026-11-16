@@ -420,7 +420,13 @@ class CultureExperimentRunner:
                 )
             )
             await self._safe_all(replicates, "resume after interrupted dispatch", events, journal)
-            if any(item.safe_state is None or not item.safe_state.reached for item in replicates):
+            # Only reactors that may have received a command were asked; one with no
+            # journalled command was never sent anything, so there is nothing to confirm.
+            if any(
+                item.safe_state is None or not item.safe_state.reached
+                for item in replicates
+                if item.sent
+            ):
                 raise CultureResumeError(
                     "could not confirm safe state after an interrupted dispatch; "
                     "check the reactors and reconcile the experiment"
